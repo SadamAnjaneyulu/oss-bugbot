@@ -48,11 +48,17 @@ def compute_score(vote_count: int, passes_surviving: int, verdict: str) -> float
 
 async def run_review(
     owner: str, repo: str, pr_number: int, head_sha: str, github_token: str,
-    gemini_api_key: str, groq_api_key: str, root: Path,
+    gemini_api_key: str, groq_api_key: str, root: Path, post: bool = True,
 ) -> dict:
     """Returns the findings.json-shaped dict. Never raises for expected
     conditions (oversize PR, refusals, gate exhaustion) - those are all
     degradations logged in the returned dict, per "Degrade, never crash".
+
+    post=True is the library default (matches review.yml's existing
+    production behavior unchanged). cli.py, the local ad-hoc wrapper that
+    can point at any public PR a token can reach, defaults ITS flag the
+    other way - dry-run unless --post is passed explicitly. A tool that can
+    be pointed at a stranger's real PR should not post there by default.
     """
     degradations: list[dict] = []
     skipped_files: list[str] = []
@@ -145,11 +151,16 @@ async def run_review(
         if verdict.verdict == "confirmed":
             confirmed_pairs.append((cluster.merged, verdict))
 
-    # --- Post
+    # --- Post (dry-run reads existing comments for accurate dedupe-aware
+    # preview counts, but never calls the write endpoint - a tool that can
+    # be pointed at any public PR should not post there without --post)
     async with httpx.AsyncClient(timeout=30.0) as http_client:
         existing_markers = await fetch_existing_markers(http_client, owner, repo, pr_number, github_token)
         to_post = build_review_comments(confirmed_pairs, existing_markers)
-        post_result = await post_review(http_client, owner, repo, pr_number, github_token, head_sha, to_post)
+        if post:
+            post_result = await post_review(http_client, owner, repo, pr_number, github_token, head_sha, to_post)
+        else:
+            post_result = {"posted": False, "reason": "dry_run", "count": len(to_post), "fallback": False}
 
     return {
         "schema_version": SCHEMA_VERSION,
