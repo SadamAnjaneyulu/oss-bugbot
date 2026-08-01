@@ -144,6 +144,12 @@ paste another link when one finishes.
 python src/tui.py
 ```
 
+New to pull requests? `python src/tui.py --demo` skips typing anything and
+automatically reviews oss-bugbot's own [PR #2](https://github.com/SadamAnjaneyulu/oss-bugbot/pull/2)
+(a real planted SQL injection) the moment it starts. It's a live LLM ensemble, not
+scripted — an occasional 0-findings rerun on the same PR is expected variance
+(A2 needs ≥2/4 A1 passes to agree; that's not guaranteed every single run), not a bug.
+
 Progress is genuinely live, not a fake spinner: `main.run_review`'s optional
 `on_progress(stage, detail)` callback fires the instant each individual A1 pass
 finishes (not when the whole 4-pass batch finishes), plus once each for the size gate,

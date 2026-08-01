@@ -33,6 +33,8 @@ import cli
 from llm import GEMINI_FLASH, GEMINI_FLASH_LITE, GROQ_PRIMARY
 from main import run_review
 
+DEMO_OWNER, DEMO_REPO, DEMO_PR = "SadamAnjaneyulu", "oss-bugbot", 2
+
 STAGE_LABELS = {
     "size_gate": "Size gate",
     "diff_fetched": "Diff fetched",
@@ -158,12 +160,14 @@ class BugbotTUI(App):
     """
     BINDINGS = [("ctrl+c", "quit", "Quit")]
 
-    def __init__(self, github_token: str, gemini_api_key: str, groq_api_key: str, post: bool = False):
+    def __init__(self, github_token: str, gemini_api_key: str, groq_api_key: str,
+                 post: bool = False, demo: bool = False):
         super().__init__()
         self.github_token = github_token
         self.gemini_api_key = gemini_api_key
         self.groq_api_key = groq_api_key
         self.post = post
+        self.demo = demo
         self.completed_stages: list[str] = []
         self.running = False
         self._stage_label = "[dim]Idle - paste a repo or PR link below[/]"
@@ -192,11 +196,18 @@ class BugbotTUI(App):
         self.query_one("#log", RichLog).border_title = "Review log"
         self.query_one("#sidebar", Vertical).border_title = "oss-bugbot"
         log = self.query_one("#log", RichLog)
+        demo_url = f"github.com/{DEMO_OWNER}/{DEMO_REPO}/pull/{DEMO_PR}"
         log.write(
             "[dim]4x Gemini review . vote . Groq adversarial validate[/]\n"
-            "[dim]Paste a GitHub repo or pull request link below. Ctrl+C to quit.[/]"
+            "[dim]A 'pull request' (PR) is a proposed code change on GitHub, open for review.[/]\n"
+            "[dim]This reviews one PR's changes and flags real bugs in them. Ctrl+C to quit.[/]\n\n"
+            f"[dim]New here? Try this PR - it usually catches a real planted bug:[/] [bold cyan]{demo_url}[/]\n"
+            "[dim](it's a live LLM ensemble, not scripted - occasionally 0 findings on a rerun is normal)[/]"
         )
         self.query_one(Input).focus()
+        if self.demo:
+            log.write("[dim]--demo: running the example above automatically...[/]")
+            self.run_worker(self.do_review(DEMO_OWNER, DEMO_REPO, DEMO_PR), exclusive=True)
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         url = event.value.strip()
@@ -328,6 +339,10 @@ def main() -> int:
     parser.add_argument("--post", action="store_true",
                          help="Enable posting real reviews - still asks to confirm before each individual post. "
                               "Default is dry-run only (findings printed and written to findings.json, never posted).")
+    parser.add_argument("--demo", action="store_true",
+                         help="Skip typing anything - automatically reviews oss-bugbot PR #2 (a real planted SQL "
+                              "injection) the moment the app starts. It's a live LLM ensemble, not scripted, so an "
+                              "occasional 0-findings rerun is expected variance, not a bug.")
     args = parser.parse_args()
 
     missing = cli.check_env_vars()
@@ -341,6 +356,7 @@ def main() -> int:
         gemini_api_key=os.environ["GEMINI_API_KEY"],
         groq_api_key=os.environ["GROQ_API_KEY"],
         post=args.post,
+        demo=args.demo,
     )
     app.run()
     return 0
