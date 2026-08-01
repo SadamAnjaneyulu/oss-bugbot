@@ -83,16 +83,18 @@ class TestRunPass(unittest.TestCase):
 
     def test_direct_final_answer_no_tools(self):
         client = make_client([final_response(VALID_FINDING_JSON)])
-        result = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
+        result, usage = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
         self.assertIsInstance(result, ReviewerOutput)
         self.assertEqual(len(result.findings), 1)
+        self.assertEqual(usage.input_tokens, 10)
+        self.assertEqual(usage.output_tokens, 20)
 
     def test_one_tool_call_then_final_answer(self):
         client = make_client([
             tool_call_response("read_file", {"path": "app.py"}),
             final_response(VALID_FINDING_JSON),
         ])
-        result = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
+        result, usage = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
         self.assertIsInstance(result, ReviewerOutput)
         self.assertEqual(client.aio.models.generate_content.await_count, 2)
 
@@ -102,20 +104,21 @@ class TestRunPass(unittest.TestCase):
         responses = [tool_call_response("list_dir", {"path": "."}) for _ in range(MAX_TOOL_CALLS)]
         responses.append(final_response(VALID_FINDING_JSON))
         client = make_client(responses)
-        result = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
+        result, usage = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
         self.assertIsInstance(result, ReviewerOutput)
         # MAX_TOOL_CALLS tool turns + 1 forced-final turn
         self.assertEqual(client.aio.models.generate_content.await_count, MAX_TOOL_CALLS + 1)
+        self.assertEqual(usage.tool_calls_used, MAX_TOOL_CALLS)
 
     def test_safety_refusal_returns_none_not_exception(self):
         client = make_client([final_response(None, finish_reason="SAFETY")])
-        result = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
+        result, usage = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
         self.assertIsNone(result)
 
     def test_empty_candidates_returns_none(self):
         response = SimpleNamespace(candidates=[], text=None, usage_metadata=None)
         client = make_client([response])
-        result = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
+        result, usage = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
         self.assertIsNone(result)
 
     def test_g1_failure_retries_and_recovers(self):
@@ -128,9 +131,13 @@ class TestRunPass(unittest.TestCase):
             }],
         })
         client = make_client([final_response(bad_json), final_response(VALID_FINDING_JSON)])
-        result = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
+        result, usage = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
         self.assertIsInstance(result, ReviewerOutput)
         self.assertEqual(client.aio.models.generate_content.await_count, 2)
+        # Usage sums BOTH attempts, not just the one that finally validated -
+        # the rejected first attempt spent real tokens too.
+        self.assertEqual(usage.input_tokens, 20)
+        self.assertEqual(usage.output_tokens, 40)
 
     def test_g1_failure_exhausted_returns_none(self):
         bad_json = json.dumps({
@@ -142,7 +149,7 @@ class TestRunPass(unittest.TestCase):
             }],
         })
         client = make_client([final_response(bad_json)] * 10)  # always fails G1
-        result = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
+        result, usage = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
         self.assertIsNone(result)
 
 

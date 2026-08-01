@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 
 from gates import GateViolation, NodeExhausted, check_g3, run_with_retries
-from llm import SafetyRefusal, call_gemini, call_groq, call_with_provider_fallback
+from llm import LLMResponse, SafetyRefusal, TokenUsage, call_gemini, call_groq, call_with_provider_fallback
 from schemas import Cluster, ValidatorOutput, to_response_schema
 
 SYSTEM_PROMPT_TEMPLATE = """\
@@ -48,7 +48,7 @@ def _build_user_prompt(cluster: Cluster, feedback: str | None) -> str:
 async def _call_a3(
     groq_client, gemini_client, groq_model: str, gemini_model: str,
     groq_sem, gemini_sem, cluster: Cluster, feedback: str | None,
-) -> str:
+) -> LLMResponse:
     schema = to_response_schema(ValidatorOutput)
     user = _build_user_prompt(cluster, feedback)
 
@@ -60,8 +60,7 @@ async def _call_a3(
         system = SYSTEM_PROMPT_TEMPLATE.format(cluster_id=cluster.cluster_id, family="gemini")
         return await call_gemini(gemini_client, gemini_model, system, user, schema, gemini_sem)
 
-    response = await call_with_provider_fallback(primary, fallback)
-    return response.text
+    return await call_with_provider_fallback(primary, fallback)
 
 
 def _uncertain_fallback(cluster: Cluster) -> ValidatorOutput:
@@ -78,12 +77,17 @@ def _uncertain_fallback(cluster: Cluster) -> ValidatorOutput:
 async def run_validator(
     groq_client, gemini_client, groq_model: str, gemini_model: str,
     groq_sem, gemini_sem, cluster: Cluster,
-) -> ValidatorOutput:
+) -> tuple[ValidatorOutput, TokenUsage]:
     """Never raises. NodeExhausted or a refusal on both providers degrades
     to an "uncertain" verdict rather than dropping the finding silently.
+    token_usage sums every attempt including failed retries.
     """
+    total_usage = TokenUsage()
+
     async def agent_call(feedback: str | None) -> str:
-        return await _call_a3(groq_client, gemini_client, groq_model, gemini_model, groq_sem, gemini_sem, cluster, feedback)
+        response = await _call_a3(groq_client, gemini_client, groq_model, gemini_model, groq_sem, gemini_sem, cluster, feedback)
+        total_usage.add(response)
+        return response.text
 
     def validate_fn(raw_text: str) -> ValidatorOutput:
         output = ValidatorOutput.model_validate_json(raw_text)
@@ -91,24 +95,31 @@ async def run_validator(
         return output
 
     try:
-        return await run_with_retries(agent_call, validate_fn)
+        result = await run_with_retries(agent_call, validate_fn)
+        return result, total_usage
     except (NodeExhausted, SafetyRefusal):
-        return _uncertain_fallback(cluster)
+        return _uncertain_fallback(cluster), total_usage
 
 
 async def run_all_validators(
     groq_client, gemini_client, groq_model: str, gemini_model: str,
     groq_sem, gemini_sem, clusters: list[Cluster],
-) -> list[ValidatorOutput]:
+) -> tuple[list[ValidatorOutput], TokenUsage]:
     """Fan-out, one call per surviving cluster. groq_sem should be
     asyncio.Semaphore(1) (see plan: Groq's TPM ceiling trips under any
     real concurrency) - passed in, not hardcoded here, so tests can use a
     looser semaphore without touching this module.
     """
+    total_usage = TokenUsage()
     if not clusters:
-        return []
+        return [], total_usage
     results = await asyncio.gather(*[
         run_validator(groq_client, gemini_client, groq_model, gemini_model, groq_sem, gemini_sem, c)
         for c in clusters
     ])
-    return list(results)
+    verdicts = []
+    for verdict, usage in results:
+        verdicts.append(verdict)
+        total_usage.input_tokens += usage.input_tokens
+        total_usage.output_tokens += usage.output_tokens
+    return verdicts, total_usage

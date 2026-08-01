@@ -9,6 +9,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import main  # noqa: E402
 from diff import FileMeta  # noqa: E402
+from llm import TokenUsage  # noqa: E402
+from passes import PassUsage  # noqa: E402
 from schemas import Cluster, Finding, ValidatorOutput  # noqa: E402
 
 
@@ -51,6 +53,9 @@ class TestRunReviewOversizeGate(unittest.TestCase):
         self.assertTrue(result["skipped"])
         self.assertIn("changed lines", result["skip_reason"])
         mock_fetch_diff.assert_not_called()  # the whole point of metadata-first gating
+        # Skipped before any LLM call - token_usage must still be present
+        # (same schema key on every return path) and all zero.
+        self.assertEqual(result["token_usage"]["total_tokens"], 0)
 
 
 class TestRunReviewHappyPath(unittest.TestCase):
@@ -78,13 +83,13 @@ class TestRunReviewHappyPath(unittest.TestCase):
             return diff_text
 
         async def fake_run_pass(*a, **kw):
-            return pass_result
+            return pass_result, PassUsage(input_tokens=10, output_tokens=20, tool_calls_used=1)
 
         async def fake_run_aggregation(*a, **kw):
-            return [cluster], False
+            return [cluster], False, TokenUsage(input_tokens=5, output_tokens=15)
 
         async def fake_run_all_validators(*a, **kw):
-            return [verdict]
+            return [verdict], TokenUsage(input_tokens=8, output_tokens=12)
 
         async def fake_fetch_existing_markers(*a, **kw):
             return set()
@@ -115,6 +120,14 @@ class TestRunReviewHappyPath(unittest.TestCase):
         self.assertEqual(len(posted_comments), 1)
         self.assertEqual(posted_comments[0]["path"], "app.py")
 
+        # Token accounting: 4 A1 passes (10/20 each) + 1 A2 call (5/15) +
+        # 1 A3 call (8/12), summed across every stage into one total.
+        usage = result["token_usage"]
+        self.assertEqual(usage["input_tokens"], 4 * 10 + 5 + 8)
+        self.assertEqual(usage["output_tokens"], 4 * 20 + 15 + 12)
+        self.assertEqual(usage["total_tokens"], usage["input_tokens"] + usage["output_tokens"])
+        self.assertEqual(usage["calls"], {"a1": 4, "a2": 1, "a3": 1})
+
     def test_dry_run_never_calls_post_review_but_still_reports_findings(self):
         # cli.py's default (--post not passed) must never hit the write
         # endpoint - this is the actual safety property, not just a flag
@@ -143,13 +156,13 @@ class TestRunReviewHappyPath(unittest.TestCase):
             return diff_text
 
         async def fake_run_pass(*a, **kw):
-            return pass_result
+            return pass_result, PassUsage(input_tokens=10, output_tokens=20, tool_calls_used=1)
 
         async def fake_run_aggregation(*a, **kw):
-            return [cluster], False
+            return [cluster], False, TokenUsage(input_tokens=5, output_tokens=15)
 
         async def fake_run_all_validators(*a, **kw):
-            return [verdict]
+            return [verdict], TokenUsage(input_tokens=8, output_tokens=12)
 
         async def fake_fetch_existing_markers(*a, **kw):
             return set()
@@ -194,13 +207,13 @@ class TestRunReviewHappyPath(unittest.TestCase):
             return diff_text
 
         async def fake_run_pass(*a, **kw):
-            return pass_result
+            return pass_result, PassUsage(input_tokens=10, output_tokens=20, tool_calls_used=1)
 
         async def fake_run_aggregation(*a, **kw):
-            return [cluster], False
+            return [cluster], False, TokenUsage(input_tokens=5, output_tokens=15)
 
         async def fake_run_all_validators(*a, **kw):
-            return [verdict]
+            return [verdict], TokenUsage(input_tokens=8, output_tokens=12)
 
         async def fake_fetch_existing_markers(*a, **kw):
             return set()
