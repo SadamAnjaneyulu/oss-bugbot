@@ -132,7 +132,25 @@ Stated before any benchmark exists, not after a bad result:
 The GitHub Actions workflow above is the production runtime — it only runs on repos
 where it's installed. For local development, demos, and the eval harness, there's a
 second entrypoint, [`src/cli.py`](src/cli.py), that points the same pipeline (identical
-A1/A2/A3/gates code, nothing duplicated) at **any public PR by URL**:
+A1/A2/A3/gates code, nothing duplicated) at **any public PR by URL**.
+
+Interactive session (launch once, paste PR URLs in, keep going):
+
+```bash
+python src/cli.py
+```
+
+```
+  ╭──────────────────────────────────────────────╮
+  │ oss-bugbot  local CLI                          │
+  │ 4x Gemini review · vote · Groq adversarial validate · $0/month │
+  ╰──────────────────────────────────────────────╯
+  Paste a GitHub PR URL to review it. Type 'exit' or press Ctrl+C to quit.
+
+  PR URL: https://github.com/owner/repo/pull/123
+```
+
+Or one-shot, for scripting:
 
 ```bash
 python src/cli.py --pr https://github.com/owner/repo/pull/123

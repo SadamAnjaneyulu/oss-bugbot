@@ -111,6 +111,72 @@ class TestMainMissingEnvVars(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
+class TestMainRoutesToInteractive(unittest.TestCase):
+    def test_no_pr_flag_and_env_ok_calls_interactive(self):
+        env = {"GITHUB_TOKEN": "t", "GEMINI_API_KEY": "g", "GROQ_API_KEY": "q"}
+        with patch.object(sys, "argv", ["cli.py"]), \
+             patch.dict("os.environ", env, clear=True), \
+             patch("cli.run_interactive", return_value=0) as mock_interactive:
+            code = cli.main()
+        self.assertEqual(code, 0)
+        mock_interactive.assert_called_once_with("t", "g", "q")
+
+    def test_no_pr_flag_but_missing_env_never_reaches_interactive(self):
+        with patch.object(sys, "argv", ["cli.py"]), \
+             patch.dict("os.environ", {}, clear=True), \
+             patch("cli.run_interactive") as mock_interactive:
+            code = cli.main()
+        self.assertEqual(code, 1)
+        mock_interactive.assert_not_called()
+
+
+class TestRunInteractive(unittest.TestCase):
+    def test_exit_command_returns_immediately(self):
+        with patch("cli.Prompt.ask", return_value="exit"), \
+             patch("cli.run_one_review") as mock_review:
+            code = cli.run_interactive("t", "g", "q")
+        self.assertEqual(code, 0)
+        mock_review.assert_not_called()
+
+    def test_ctrl_c_returns_cleanly(self):
+        with patch("cli.Prompt.ask", side_effect=KeyboardInterrupt):
+            code = cli.run_interactive("t", "g", "q")
+        self.assertEqual(code, 0)
+
+    def test_empty_input_is_skipped_not_treated_as_url(self):
+        # First call: blank line (should be ignored, loop again).
+        # Second call: exit.
+        with patch("cli.Prompt.ask", side_effect=["", "exit"]), \
+             patch("cli.run_one_review") as mock_review:
+            code = cli.run_interactive("t", "g", "q")
+        self.assertEqual(code, 0)
+        mock_review.assert_not_called()
+
+    def test_invalid_url_reports_error_and_continues_loop(self):
+        with patch("cli.Prompt.ask", side_effect=["not-a-url", "exit"]), \
+             patch("cli.run_one_review") as mock_review:
+            code = cli.run_interactive("t", "g", "q")
+        self.assertEqual(code, 0)
+        mock_review.assert_not_called()  # invalid URL never reaches the review call
+
+    def test_valid_url_runs_review_and_loops_back(self):
+        fake_result = {"findings": [], "post_result": {"reason": "dry_run", "count": 0}, "degradations": []}
+        with patch("cli.Prompt.ask", side_effect=["https://github.com/o/r/pull/5", "exit"]), \
+             patch("cli.Confirm.ask", return_value=False) as mock_confirm, \
+             patch("cli.run_one_review", return_value=fake_result) as mock_review:
+            code = cli.run_interactive("t", "g", "q")
+        self.assertEqual(code, 0)
+        mock_review.assert_called_once_with("o", "r", 5, "t", "g", "q", False)
+        mock_confirm.assert_called_once()
+
+    def test_review_error_none_result_does_not_crash_loop(self):
+        with patch("cli.Prompt.ask", side_effect=["https://github.com/o/r/pull/5", "exit"]), \
+             patch("cli.Confirm.ask", return_value=False), \
+             patch("cli.run_one_review", return_value=None):
+            code = cli.run_interactive("t", "g", "q")
+        self.assertEqual(code, 0)
+
+
 class TestResolvePrInfo(unittest.TestCase):
     def test_deleted_fork_raises_clear_value_error(self):
         # GitHub returns head.repo: null when the PR's source fork/branch

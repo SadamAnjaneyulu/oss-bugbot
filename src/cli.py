@@ -11,7 +11,8 @@ DOES carry over unchanged: clone, never execute. This script only clones
 and reads; it never installs, builds, or runs anything from the cloned PR.
 
 Usage:
-    python src/cli.py --pr https://github.com/owner/repo/pull/123
+    python src/cli.py                                     # interactive session
+    python src/cli.py --pr https://github.com/owner/repo/pull/123   # one-shot
     python src/cli.py --pr https://github.com/owner/repo/pull/123 --post
 
 Auth note: a fine-grained PAT only works on repos you own or a repo owner
@@ -35,6 +36,7 @@ from tempfile import TemporaryDirectory
 import httpx
 from rich.console import Console
 from rich.panel import Panel
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich import box
 
@@ -145,7 +147,7 @@ def print_findings(result: dict, posted_for_real: bool, out: Console | None = No
 
     post = result.get("post_result", {})
     if post.get("reason") == "dry_run":
-        c.print(f"[dim]Dry run[/] — would post {post['count']} comment(s). "
+        c.print(f"[dim]Dry run[/] - would post {post['count']} comment(s). "
                 f"Re-run with [bold]--post[/] to actually post to GitHub.")
     elif post.get("posted"):
         c.print(f"[bold green]Posted[/] {post['count']} comment(s) to the PR for real.")
@@ -153,78 +155,143 @@ def print_findings(result: dict, posted_for_real: bool, out: Console | None = No
         c.print(f"Nothing posted ([dim]{post.get('reason', 'unknown')}[/]).")
 
     if result.get("degradations"):
-        c.print(f"[yellow]{len(result['degradations'])} degradation(s)[/] — see findings.json for detail.")
+        c.print(f"[yellow]{len(result['degradations'])} degradation(s)[/] - see findings.json for detail.")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Run oss-bugbot locally against any public GitHub PR.")
-    parser.add_argument("--pr", required=True, help="Full PR URL, e.g. https://github.com/owner/repo/pull/123")
-    parser.add_argument("--post", action="store_true",
-                         help="Actually post the review to GitHub. Default is dry-run (print only, no write call).")
-    args = parser.parse_args()
+def check_env_vars() -> list[str]:
+    return [name for name, val in [
+        ("GITHUB_TOKEN", os.environ.get("GITHUB_TOKEN")),
+        ("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY")),
+        ("GROQ_API_KEY", os.environ.get("GROQ_API_KEY")),
+    ] if not val]
 
-    print_banner()
 
-    try:
-        owner, repo, pr_number = parse_pr_url(args.pr)
-    except ValueError as exc:
-        err_console.print(f"[bold red]Error:[/] {exc}")
-        return 1
-
-    github_token = os.environ.get("GITHUB_TOKEN")
-    gemini_api_key = os.environ.get("GEMINI_API_KEY")
-    groq_api_key = os.environ.get("GROQ_API_KEY")
-    missing = [name for name, val in
-               [("GITHUB_TOKEN", github_token), ("GEMINI_API_KEY", gemini_api_key), ("GROQ_API_KEY", groq_api_key)]
-               if not val]
-    if missing:
-        err_console.print(f"[bold red]Error:[/] missing required environment variable(s): {', '.join(missing)}")
-        err_console.print("[dim]Set them in your current shell before running this (see README, Local CLI mode).[/]")
-        return 1
-
+def run_one_review(owner: str, repo: str, pr_number: int, github_token: str,
+                    gemini_api_key: str, groq_api_key: str, post: bool) -> dict | None:
+    """Resolve -> clone -> review for exactly one PR. Returns the result
+    dict, or None if a handled error occurred (already printed). Shared by
+    both the --pr single-shot flag and the interactive session below - one
+    implementation, two entry points, not a duplicated copy of the logic.
+    """
     try:
         with console.status(f"[bold cyan]Resolving[/] {owner}/{repo}#{pr_number}...", spinner="dots"):
             info = asyncio.run(resolve_pr_info(owner, repo, pr_number, github_token))
     except httpx.HTTPStatusError as exc:
         err_console.print(f"[bold red]Error:[/] could not resolve PR ({exc.response.status_code}). "
                            f"Check the URL and that your token can read this repo.")
-        return 1
+        return None
     except httpx.RequestError as exc:
         err_console.print(f"[bold red]Error:[/] network request to GitHub failed: {exc}")
-        return 1
+        return None
     except ValueError as exc:
         err_console.print(f"[bold red]Error:[/] {exc}")
-        return 1
+        return None
     console.print(f"[bold green][OK][/] Resolved [bold]{info['head_ref']}[/] @ [dim]{info['head_sha'][:7]}[/]")
 
     with TemporaryDirectory(prefix="oss-bugbot-cli-") as tmp:
         checkout = Path(tmp)
         try:
             with console.status(f"[bold cyan]Cloning[/] {info['head_ref']} "
-                                 f"(depth 1, read-only — never executed)...", spinner="dots"):
+                                 f"(depth 1, read-only - never executed)...", spinner="dots"):
                 clone_pr_branch(info["head_clone_url"], info["head_ref"], checkout)
         except subprocess.CalledProcessError as exc:
             err_console.print(f"[bold red]Error:[/] clone failed:\n{exc.stderr}")
-            return 1
+            return None
         except subprocess.TimeoutExpired:
             err_console.print(f"[bold red]Error:[/] clone exceeded {CLONE_TIMEOUT_SECONDS}s. This repo/branch is "
-                               f"a poor fit for local CLI mode — use the Actions runtime instead.")
-            return 1
+                               f"a poor fit for local CLI mode - use the Actions runtime instead.")
+            return None
         except FileNotFoundError:
             err_console.print("[bold red]Error:[/] git executable not found on PATH. Install git and try again.")
-            return 1
+            return None
         console.print("[bold green][OK][/] Cloned")
 
-        with console.status("[bold cyan]Running review[/] — 4x Gemini, vote, Groq adversarial validate "
+        with console.status("[bold cyan]Running review[/] - 4x Gemini, vote, Groq adversarial validate "
                              "[dim](typically 20-60s)[/]...", spinner="dots"):
             result = asyncio.run(run_review(
                 owner, repo, pr_number, info["head_sha"], github_token,
-                gemini_api_key, groq_api_key, checkout, post=args.post,
+                gemini_api_key, groq_api_key, checkout, post=post,
             ))
         console.print("[bold green][OK][/] Review complete\n")
 
-    print_findings(result, posted_for_real=args.post)
     Path("findings.json").write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+    return result
+
+
+def run_interactive(github_token: str, gemini_api_key: str, groq_api_key: str) -> int:
+    """Claude Code / OpenCode style: launch once, paste PR URLs into the
+    running session, keep going until you quit. Reuses run_one_review for
+    every iteration - the interactive loop is presentation, not new logic.
+    """
+    print_banner()
+    console.print("[dim]Paste a GitHub PR URL to review it. Type 'exit' or press Ctrl+C to quit.[/]\n")
+
+    while True:
+        try:
+            url = Prompt.ask("[bold cyan]PR URL[/]")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Goodbye.[/]")
+            return 0
+
+        url = url.strip()
+        if url.lower() in ("exit", "quit", "q"):
+            console.print("[dim]Goodbye.[/]")
+            return 0
+        if not url:
+            continue
+
+        try:
+            owner, repo, pr_number = parse_pr_url(url)
+        except ValueError as exc:
+            err_console.print(f"[bold red]Error:[/] {exc}\n")
+            continue
+
+        try:
+            post = Confirm.ask("Actually post the review to GitHub?", default=False)
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Goodbye.[/]")
+            return 0
+
+        result = run_one_review(owner, repo, pr_number, github_token, gemini_api_key, groq_api_key, post)
+        if result is not None:
+            print_findings(result, posted_for_real=post)
+        console.print()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run oss-bugbot locally against any public GitHub PR.")
+    parser.add_argument("--pr", required=False, default=None,
+                         help="Full PR URL. If omitted, starts an interactive session instead of exiting after one PR.")
+    parser.add_argument("--post", action="store_true",
+                         help="Actually post the review to GitHub. Default is dry-run (print only, no write call). "
+                              "Only applies in --pr mode - interactive mode asks each time.")
+    args = parser.parse_args()
+
+    missing = check_env_vars()
+    if missing:
+        print_banner()
+        err_console.print(f"[bold red]Error:[/] missing required environment variable(s): {', '.join(missing)}")
+        err_console.print("[dim]Set them in your current shell before running this (see README, Local CLI mode).[/]")
+        return 1
+
+    github_token = os.environ["GITHUB_TOKEN"]
+    gemini_api_key = os.environ["GEMINI_API_KEY"]
+    groq_api_key = os.environ["GROQ_API_KEY"]
+
+    if args.pr is None:
+        return run_interactive(github_token, gemini_api_key, groq_api_key)
+
+    print_banner()
+    try:
+        owner, repo, pr_number = parse_pr_url(args.pr)
+    except ValueError as exc:
+        err_console.print(f"[bold red]Error:[/] {exc}")
+        return 1
+
+    result = run_one_review(owner, repo, pr_number, github_token, gemini_api_key, groq_api_key, args.post)
+    if result is None:
+        return 1
+    print_findings(result, posted_for_real=args.post)
     return 0
 
 
