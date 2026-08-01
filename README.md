@@ -170,21 +170,36 @@ python -m unittest discover -s tests
 
 ## Status
 
-Phase 1 (build) in progress. 191 tests, all green, including live-verified round
-trips against both Gemini and Groq — not mocked; see commit history for real
-provider-behavior bugs the live checks caught that mocking alone would have missed,
-one real "pwn request" checkout-ordering vulnerability fixed before it ever ran a PR,
-and a multi-angle code review of the CLI wrapper that caught three uncaught-exception
-gaps before they shipped.
+Phase 1 (build) substantially complete, Phase 3 (eval) started. 210 tests, all green,
+including live-verified round trips against both Gemini and Groq — not mocked; see
+commit history for real provider-behavior bugs the live checks caught that mocking
+alone would have missed, one real "pwn request" checkout-ordering vulnerability fixed
+before it ever ran a PR, and pre-commit secret scanning that has since caught two real
+accidental-key-commit attempts for real.
 
-**Verified live**, same-repo PR: the full pipeline ran end to end against a real
-planted bug and posted a correct, correctly-localized review comment — see
-[PR #1](https://github.com/SadamAnjaneyulu/oss-bugbot/pull/1). `findings.json` now
-carries per-run token accounting (input/output tokens, call counts per stage) — the
-unit economics the eval harness needs.
+**Verified live, twice, two different bug classes:** a planted null-deref via the
+Actions runtime ([PR #1](https://github.com/SadamAnjaneyulu/oss-bugbot/pull/1)) and a
+planted SQL injection via the local CLI
+([PR #2](https://github.com/SadamAnjaneyulu/oss-bugbot/pull/2)) were both correctly
+found, confirmed, and reported with accurate comments. Along the way, live testing
+caught A3's adversarial validator refuting both of those real bugs by inventing
+unstated facts about the codebase — fixed with two rounds of prompt iteration, each
+re-verified live before moving on, not assumed fixed after one edit.
+
+**`findings.json`** carries per-run token accounting (input/output tokens, call counts
+per stage) — the unit economics the eval harness needs.
+
+**Eval harness has run for real, at small scale:** `harvest.py` mines merged bug-fix
+PRs and reconstructs ground truth automatically — no hand-labeling — by reversing the
+fix diff (verified against a real PR before writing any harvesting code: `git diff
+<head> <base>`, SHAs swapped, is genuinely the fix's exact inverse). First live run
+against `psf/requests` and `pallets/flask` built 3 real cases with real ground truth;
+see [`eval/bench/`](eval/bench/). `score.py` (replay cases through the pipeline,
+compute precision/recall) doesn't exist yet — 3 cases is proof the harvesting
+mechanism works, not a benchmark.
 
 **Not yet verified:** a genuine fork PR from a different account (the actual
 justification for `pull_request_target` — a same-repo PR never exercises the
-`head.repo != base.repo` checkout path or the S9 approval gate), and the Phase 3
-eval harness (precision/recall with confidence intervals against a stratified,
-contamination-checked benchmark).
+`head.repo != base.repo` checkout path or the S9 approval gate), and precision/recall
+with confidence intervals against a stratified, contamination-checked benchmark at
+real scale (100+ cases per the original plan).
