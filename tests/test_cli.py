@@ -2,13 +2,25 @@ import asyncio
 import io
 import sys
 import unittest
-from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
+
+from rich.console import Console
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import cli  # noqa: E402
+
+
+def _test_console() -> tuple[Console, io.StringIO]:
+    """Rich's Console binds its output file at construction time, so
+    contextlib.redirect_stdout (which patches sys.stdout) never reaches it -
+    tests must build a Console(file=buf) and pass it via print_findings's
+    `out` parameter instead. force_terminal=False, no_color=True strips
+    ANSI styling so assertions can match plain substrings.
+    """
+    buf = io.StringIO()
+    return Console(file=buf, force_terminal=False, no_color=True, width=120), buf
 
 
 class TestParsePrUrl(unittest.TestCase):
@@ -39,15 +51,14 @@ class TestParsePrUrl(unittest.TestCase):
 
 class TestPrintFindings(unittest.TestCase):
     def test_skipped_prints_reason(self):
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            cli.print_findings({"skipped": True, "skip_reason": "too many lines"}, posted_for_real=False)
+        test_console, buf = _test_console()
+        cli.print_findings({"skipped": True, "skip_reason": "too many lines"}, posted_for_real=False, out=test_console)
         self.assertIn("too many lines", buf.getvalue())
 
     def test_no_findings_says_so(self):
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            cli.print_findings({"findings": [], "post_result": {"reason": "dry_run", "count": 0}}, posted_for_real=False)
+        test_console, buf = _test_console()
+        cli.print_findings({"findings": [], "post_result": {"reason": "dry_run", "count": 0}},
+                            posted_for_real=False, out=test_console)
         self.assertIn("No confirmed findings", buf.getvalue())
 
     def test_dry_run_tells_user_to_pass_post_flag(self):
@@ -58,9 +69,8 @@ class TestPrintFindings(unittest.TestCase):
             "post_result": {"reason": "dry_run", "count": 1, "posted": False},
             "degradations": [],
         }
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            cli.print_findings(result, posted_for_real=False)
+        test_console, buf = _test_console()
+        cli.print_findings(result, posted_for_real=False, out=test_console)
         out = buf.getvalue()
         self.assertIn("Dry run", out)
         self.assertIn("--post", out)
@@ -72,9 +82,8 @@ class TestPrintFindings(unittest.TestCase):
             "post_result": {"posted": True, "count": 2, "reason": None},
             "degradations": [],
         }
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            cli.print_findings(result, posted_for_real=True)
+        test_console, buf = _test_console()
+        cli.print_findings(result, posted_for_real=True, out=test_console)
         self.assertIn("Posted 2 comment(s) to the PR for real", buf.getvalue())
 
     def test_degradations_surfaced(self):
@@ -83,9 +92,8 @@ class TestPrintFindings(unittest.TestCase):
             "post_result": {"reason": "dry_run", "count": 0, "posted": False},
             "degradations": [{"node": "a1", "action": "dropped"}],
         }
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            cli.print_findings(result, posted_for_real=False)
+        test_console, buf = _test_console()
+        cli.print_findings(result, posted_for_real=False, out=test_console)
         self.assertIn("1 degradation", buf.getvalue())
 
 

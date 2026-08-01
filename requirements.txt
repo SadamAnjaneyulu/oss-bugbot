@@ -5,3 +5,4 @@ pyyaml
 semgrep
 google-genai
 groq
+rich

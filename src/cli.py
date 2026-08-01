@@ -33,11 +33,31 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import httpx
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich import box
 
 from main import run_review
 
 PR_URL_RE = re.compile(r"github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
 CLONE_TIMEOUT_SECONDS = 120
+
+# Presentation only - every function below this line is display, not logic.
+# parse_pr_url/resolve_pr_info/clone_pr_branch (further down) are untouched.
+console = Console()
+err_console = Console(stderr=True)
+
+SEVERITY_STYLE = {"high": "bold red", "medium": "yellow", "low": "cyan"}
+VERDICT_STYLE = {"confirmed": "bold green", "uncertain": "yellow", "false_positive": "dim"}
+
+
+def print_banner() -> None:
+    console.print(Panel.fit(
+        "[bold cyan]oss-bugbot[/]  [dim]local CLI[/]\n"
+        "[dim]4x Gemini review - Gemini vote - Groq adversarial validate - $0/month[/]",
+        border_style="cyan",
+    ))
 
 
 def parse_pr_url(url: str) -> tuple[str, str, int]:
@@ -85,31 +105,55 @@ def clone_pr_branch(clone_url: str, ref: str, dest: Path) -> None:
     )
 
 
-def print_findings(result: dict, posted_for_real: bool) -> None:
+def print_findings(result: dict, posted_for_real: bool, out: Console | None = None) -> None:
+    """out: injectable Console, defaults to the module-level one. Rich's
+    Console captures its own stdout reference at construction time, so
+    contextlib.redirect_stdout (which patches the sys.stdout global) does
+    NOT capture its output the way it does plain print() - tests must pass
+    a Console(file=io.StringIO()) here instead. This is the standard way
+    to test a rich-based CLI, not a workaround.
+    """
+    c = out or console
     if result.get("skipped"):
-        print(f"Skipped: {result.get('skip_reason')}")
+        c.print(Panel(f"[yellow]Skipped:[/] {result.get('skip_reason')}", border_style="yellow"))
         return
 
     findings = result.get("findings", [])
     if not findings:
-        print("No confirmed findings.")
+        c.print(Panel("[bold green]No confirmed findings.[/]", border_style="green"))
     else:
-        print(f"{len(findings)} finding(s):\n")
+        table = Table(title=f"{len(findings)} finding(s)", box=box.ROUNDED, show_lines=True,
+                       title_style="bold")
+        table.add_column("File:Line", style="bold")
+        table.add_column("Category/Severity")
+        table.add_column("Title")
+        table.add_column("Verdict")
+        table.add_column("Score", justify="right")
+        table.add_column("Votes", justify="right")
         for f in findings:
-            print(f"  {f['file']}:{f['line']}  [{f['category']}/{f['severity']}]  {f['title']}")
-            print(f"    verdict={f['verdict']}  score={f['score']:.2f}  votes={f['vote_count']}/{f['passes_surviving']}")
-        print()
+            sev_style = SEVERITY_STYLE.get(f["severity"], "white")
+            verdict_style = VERDICT_STYLE.get(f["verdict"], "white")
+            table.add_row(
+                f"{f['file']}:{f['line']}",
+                f"[{sev_style}]{f['category']}/{f['severity']}[/]",
+                f["title"],
+                f"[{verdict_style}]{f['verdict']}[/]",
+                f"{f['score']:.2f}",
+                f"{f['vote_count']}/{f['passes_surviving']}",
+            )
+        c.print(table)
 
     post = result.get("post_result", {})
     if post.get("reason") == "dry_run":
-        print(f"Dry run - would post {post['count']} comment(s). Re-run with --post to actually post to GitHub.")
+        c.print(f"[dim]Dry run[/] — would post {post['count']} comment(s). "
+                f"Re-run with [bold]--post[/] to actually post to GitHub.")
     elif post.get("posted"):
-        print(f"Posted {post['count']} comment(s) to the PR for real.")
+        c.print(f"[bold green]Posted[/] {post['count']} comment(s) to the PR for real.")
     else:
-        print(f"Nothing posted ({post.get('reason', 'unknown')}).")
+        c.print(f"Nothing posted ([dim]{post.get('reason', 'unknown')}[/]).")
 
     if result.get("degradations"):
-        print(f"\n{len(result['degradations'])} degradation(s) - see findings.json for detail.")
+        c.print(f"[yellow]{len(result['degradations'])} degradation(s)[/] — see findings.json for detail.")
 
 
 def main() -> int:
@@ -119,10 +163,12 @@ def main() -> int:
                          help="Actually post the review to GitHub. Default is dry-run (print only, no write call).")
     args = parser.parse_args()
 
+    print_banner()
+
     try:
         owner, repo, pr_number = parse_pr_url(args.pr)
     except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        err_console.print(f"[bold red]Error:[/] {exc}")
         return 1
 
     github_token = os.environ.get("GITHUB_TOKEN")
@@ -132,45 +178,50 @@ def main() -> int:
                [("GITHUB_TOKEN", github_token), ("GEMINI_API_KEY", gemini_api_key), ("GROQ_API_KEY", groq_api_key)]
                if not val]
     if missing:
-        print(f"Error: missing required environment variable(s): {', '.join(missing)}", file=sys.stderr)
-        print("Set them in your current shell before running this (see README, Local CLI mode).", file=sys.stderr)
+        err_console.print(f"[bold red]Error:[/] missing required environment variable(s): {', '.join(missing)}")
+        err_console.print("[dim]Set them in your current shell before running this (see README, Local CLI mode).[/]")
         return 1
 
-    print(f"Resolving {owner}/{repo}#{pr_number}...")
     try:
-        info = asyncio.run(resolve_pr_info(owner, repo, pr_number, github_token))
+        with console.status(f"[bold cyan]Resolving[/] {owner}/{repo}#{pr_number}...", spinner="dots"):
+            info = asyncio.run(resolve_pr_info(owner, repo, pr_number, github_token))
     except httpx.HTTPStatusError as exc:
-        print(f"Error: could not resolve PR ({exc.response.status_code}). "
-              f"Check the URL and that your token can read this repo.", file=sys.stderr)
+        err_console.print(f"[bold red]Error:[/] could not resolve PR ({exc.response.status_code}). "
+                           f"Check the URL and that your token can read this repo.")
         return 1
     except httpx.RequestError as exc:
-        print(f"Error: network request to GitHub failed: {exc}", file=sys.stderr)
+        err_console.print(f"[bold red]Error:[/] network request to GitHub failed: {exc}")
         return 1
     except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        err_console.print(f"[bold red]Error:[/] {exc}")
         return 1
+    console.print(f"[bold green][OK][/] Resolved [bold]{info['head_ref']}[/] @ [dim]{info['head_sha'][:7]}[/]")
 
     with TemporaryDirectory(prefix="oss-bugbot-cli-") as tmp:
         checkout = Path(tmp)
-        print(f"Cloning {info['head_ref']} (depth 1, read-only - never executed)...")
         try:
-            clone_pr_branch(info["head_clone_url"], info["head_ref"], checkout)
+            with console.status(f"[bold cyan]Cloning[/] {info['head_ref']} "
+                                 f"(depth 1, read-only — never executed)...", spinner="dots"):
+                clone_pr_branch(info["head_clone_url"], info["head_ref"], checkout)
         except subprocess.CalledProcessError as exc:
-            print(f"Error: clone failed:\n{exc.stderr}", file=sys.stderr)
+            err_console.print(f"[bold red]Error:[/] clone failed:\n{exc.stderr}")
             return 1
         except subprocess.TimeoutExpired:
-            print(f"Error: clone exceeded {CLONE_TIMEOUT_SECONDS}s. This repo/branch is a poor fit "
-                  f"for local CLI mode - use the Actions runtime instead.", file=sys.stderr)
+            err_console.print(f"[bold red]Error:[/] clone exceeded {CLONE_TIMEOUT_SECONDS}s. This repo/branch is "
+                               f"a poor fit for local CLI mode — use the Actions runtime instead.")
             return 1
         except FileNotFoundError:
-            print("Error: git executable not found on PATH. Install git and try again.", file=sys.stderr)
+            err_console.print("[bold red]Error:[/] git executable not found on PATH. Install git and try again.")
             return 1
+        console.print("[bold green][OK][/] Cloned")
 
-        print("Running review (calls Gemini and Groq - typically 20-60s)...")
-        result = asyncio.run(run_review(
-            owner, repo, pr_number, info["head_sha"], github_token,
-            gemini_api_key, groq_api_key, checkout, post=args.post,
-        ))
+        with console.status("[bold cyan]Running review[/] — 4x Gemini, vote, Groq adversarial validate "
+                             "[dim](typically 20-60s)[/]...", spinner="dots"):
+            result = asyncio.run(run_review(
+                owner, repo, pr_number, info["head_sha"], github_token,
+                gemini_api_key, groq_api_key, checkout, post=args.post,
+            ))
+        console.print("[bold green][OK][/] Review complete\n")
 
     print_findings(result, posted_for_real=args.post)
     Path("findings.json").write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
