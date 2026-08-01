@@ -173,7 +173,12 @@ def main() -> int:
     github_token = os.environ["GITHUB_TOKEN"]
     gemini_api_key = os.environ["GEMINI_API_KEY"]
     groq_api_key = os.environ["GROQ_API_KEY"]
-    root = Path(os.environ.get("GITHUB_WORKSPACE", "."))
+    # PR_CHECKOUT_PATH, not GITHUB_WORKSPACE: the workflow checks out this
+    # bugbot's own (trusted, base-branch) code at GITHUB_WORKSPACE and the
+    # PR's (untrusted) content into a separate directory. root must point at
+    # the PR content - sandbox.py's tools read from here, nothing here is
+    # ever executed or installed. See review.yml.
+    root = Path(os.environ["PR_CHECKOUT_PATH"])
 
     result = asyncio.run(run_review(owner, repo, pr_number, head_sha, github_token, gemini_api_key, groq_api_key, root))
 

@@ -1,0 +1,109 @@
+name: Bugbot Review
+
+# pull_request_target runs in the BASE repo's context (write token, secrets)
+# while a fork PR's content is untrusted. Safe here ONLY because of one
+# invariant, enforced structurally below, not just documented: we clone the
+# PR's code, we never execute it. See plan "SECURITY: the fork-PR model".
+#
+# S9 (not set here - a repo Setting, not a workflow line): enable "Require
+# approval for first-time contributor workflow runs" in
+# Settings > Actions > General before relying on this in production. It
+# bounds attempt count against everything below before any of it has to be
+# correct.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: true
+        type: number
+
+permissions:
+  contents: read # NEVER contents:write - see plan "two-workflow split"
+  pull-requests: write
+
+concurrency:
+  group: bugbot-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true # 5 rapid pushes -> 4 cancelled -> 1 review of the FINAL state
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # Actions defaults to 6 HOURS - one hung LLM call must not burn the day's quota
+    steps:
+      # Resolves PR_NUMBER to head_sha/head_repo via the API instead of
+      # trusting event-context fields directly, so pull_request_target and
+      # workflow_dispatch (manual testing, no pull_request context) are
+      # handled by the exact same code path below. PR_NUMBER is a
+      # system-controlled integer, not attacker-controlled text - safe to
+      # interpolate; PR title/body/branch NEVER appear in a run: block (S3).
+      - name: Resolve PR info
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          data=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}")
+          echo "head_sha=$(echo "$data" | jq -r .head.sha)" >> "$GITHUB_OUTPUT"
+          echo "head_repo=$(echo "$data" | jq -r .head.repo.full_name)" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      # Checkout #1: THIS repo's own code, default ref. For
+      # pull_request_target the default ref is the BASE branch - the
+      # property that makes this event safe when used correctly. requirements.txt,
+      # rules/, and src/ installed and run below all come from here, never
+      # from the PR.
+      - name: Checkout bugbot (base branch, trusted)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Audit vendored Semgrep rules (S2 enforcement)
+        run: python rules/audit_rules.py
+
+      # Checkout #2: the PR's content, into a SEPARATE directory. Nothing
+      # from here is ever installed, built, imported, or executed - only
+      # read by sandbox.py's path-checked tools. This is the no-execution
+      # invariant made structural: even a bug in application code can't
+      # accidentally pip-install or exec something from this path, because
+      # nothing in the pipeline ever treats pr-checkout/ as a Python project.
+      - name: Checkout PR head (untrusted, read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.pr.outputs.head_repo }}
+          ref: ${{ steps.pr.outputs.head_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: pr-checkout
+
+      - name: Run review
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_CHECKOUT_PATH: ${{ github.workspace }}/pr-checkout
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: python src/main.py
+
+      - name: Upload findings artifact
+        if: always() # even a skipped/degraded run's findings.json is worth keeping
+        uses: actions/upload-artifact@v4
+        with:
+          name: findings-${{ steps.pr.outputs.pr_number }}
+          path: findings.json
+          retention-days: 90
+          if-no-files-found: warn
