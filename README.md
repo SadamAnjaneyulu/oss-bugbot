@@ -11,6 +11,9 @@ infrastructure — and is built to work on fork PRs, not just same-repo demos.**
 [![Cost](https://img.shields.io/badge/cost-%240%2Fmonth-brightgreen)](#architecture)
 [![Security](https://img.shields.io/badge/pull__request__target-hardened-critical)](#security-model-read-this-first)
 
+*Python · Gemini API · Groq API · GitHub Actions · Semgrep · async multi-agent
+pipeline · adversarial validation*
+
 </div>
 
 ---
@@ -20,8 +23,30 @@ publishes matter more than the bot itself.** [Known failure modes](#known-failur
 were written before any benchmark existed — a stated design boundary, not a
 post-hoc excuse for a bad result.
 
+## See it catch a real bug
+
+Real output, from [PR #1](https://github.com/SadamAnjaneyulu/oss-bugbot/pull/1) — a
+deliberately planted null-dereference, found automatically by the live pipeline and
+posted as a single inline review comment:
+
+> **`examples/demo_target.py`, line 10**
+>
+> The code retrieves a user with `users_by_id.get(user_id)` and then accesses
+> `user.name` without verifying that `user` is not `None`. If `user_id` is absent
+> from the dictionary, `get` returns `None`, causing an `AttributeError` when
+> `.name` is accessed.
+>
+> **Fix:** Add a check for `None` before using `user`, e.g. raise a custom exception
+> or handle the missing-user case explicitly.
+
+No commit, no autofix — comment only, by design. Second confirmed catch, a different
+bug class entirely, in [PR #2](https://github.com/SadamAnjaneyulu/oss-bugbot/pull/2)
+(SQL injection via unparameterized string interpolation), run through the local CLI
+instead of GitHub Actions.
+
 ## Table of contents
 
+- [See it catch a real bug](#see-it-catch-a-real-bug)
 - [Security model](#security-model-read-this-first)
 - [Architecture](#architecture)
 - [Known failure modes](#known-failure-modes)
@@ -173,8 +198,8 @@ Phase 1 (build) substantially complete, Phase 3 (eval) started. 210 tests, all g
 including live-verified round trips against both Gemini and Groq — not mocked; see
 commit history for real provider-behavior bugs the live checks caught that mocking
 alone would have missed, one real "pwn request" checkout-ordering vulnerability fixed
-before it ever ran a PR, and pre-commit secret scanning that has since caught two real
-accidental-key-commit attempts for real.
+before it ever ran a PR, and pre-commit secret scanning that has since blocked two
+separate accidental-key-commit attempts.
 
 **Verified live, twice, two different bug classes:** a planted null-deref via the
 Actions runtime ([PR #1](https://github.com/SadamAnjaneyulu/oss-bugbot/pull/1)) and a
