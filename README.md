@@ -26,7 +26,8 @@ post-hoc excuse for a bad result.
 - [Security model](#security-model-read-this-first)
 - [Architecture](#architecture)
 - [Known failure modes](#known-failure-modes)
-- [Setup](#setup)
+- [Local CLI mode](#local-cli-mode)
+- [Setup (GitHub Actions)](#setup-github-actions--the-production-runtime)
 - [Status](#status)
 
 ## Security model (read this first)
@@ -102,7 +103,42 @@ Stated before any benchmark exists, not after a bad result:
   claim to argue a real bug is a false positive. Known, tracked weakness — not a
   hidden one.
 
-## Setup
+## Local CLI mode
+
+The GitHub Actions workflow above is the production runtime — it only runs on repos
+where it's installed. For local development, demos, and the eval harness, there's a
+second entrypoint, [`src/cli.py`](src/cli.py), that points the same pipeline (identical
+A1/A2/A3/gates code, nothing duplicated) at **any public PR by URL**:
+
+```bash
+python src/cli.py --pr https://github.com/owner/repo/pull/123
+```
+
+**This has a different, simpler threat model than the Actions runtime, on purpose —
+the S1–S9 controls above do not apply here and are not meant to.** There is no
+`pull_request_target` write-token-next-to-attacker-content exposure to defend against:
+this is a user running software they control, on hardware they control, with their own
+token, choosing what PR to point it at. The one invariant that does carry over
+unchanged: the CLI only clones and reads, it never installs, builds, or executes
+anything from the cloned PR.
+
+Defaults to **dry-run** — it prints findings and writes `findings.json` locally but
+never calls the write endpoint, so pointing it at a PR you don't maintain won't post
+anything. Pass `--post` to actually post a review.
+
+Auth: a fine-grained PAT (the kind the Actions setup below uses) only authorizes repos
+you own or that explicitly approved it — it will not work against someone else's public
+repo. For that, use a **classic** PAT with the `public_repo` scope
+([github.com/settings/tokens/new](https://github.com/settings/tokens/new)).
+
+```bash
+export GITHUB_TOKEN=your-classic-pat       # public_repo scope, for arbitrary repos
+export GEMINI_API_KEY=your-gemini-key
+export GROQ_API_KEY=your-groq-key
+python src/cli.py --pr https://github.com/owner/repo/pull/123
+```
+
+## Setup (GitHub Actions — the production runtime)
 
 ```bash
 pip install -r requirements.txt
@@ -125,15 +161,18 @@ python -m unittest discover -s tests
 
 ## Status
 
-Phase 1 (build) in progress. 172 tests, all green, including live-verified round
-trips against both Gemini and Groq — not mocked; see commit history for three real
+Phase 1 (build) in progress. 191 tests, all green, including live-verified round
+trips against both Gemini and Groq — not mocked; see commit history for real
 provider-behavior bugs the live checks caught that mocking alone would have missed,
-plus one real "pwn request" checkout-ordering vulnerability fixed before it ever ran
-a PR.
+one real "pwn request" checkout-ordering vulnerability fixed before it ever ran a PR,
+and a multi-angle code review of the CLI wrapper that caught three uncaught-exception
+gaps before they shipped.
 
 **Verified live**, same-repo PR: the full pipeline ran end to end against a real
 planted bug and posted a correct, correctly-localized review comment — see
-[PR #1](https://github.com/SadamAnjaneyulu/oss-bugbot/pull/1).
+[PR #1](https://github.com/SadamAnjaneyulu/oss-bugbot/pull/1). `findings.json` now
+carries per-run token accounting (input/output tokens, call counts per stage) — the
+unit economics the eval harness needs.
 
 **Not yet verified:** a genuine fork PR from a different account (the actual
 justification for `pull_request_target` — a same-repo PR never exercises the

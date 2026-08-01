@@ -62,16 +62,18 @@ class TestRunValidator(unittest.TestCase):
         cluster = make_cluster()
         groq = groq_client_with_responses([confirmed_json()])
         gemini = gemini_client_with_responses([])  # never called
-        result = asyncio.run(run_validator(groq, gemini, "gm", "gem", self.groq_sem, self.gemini_sem, cluster))
+        result, usage = asyncio.run(run_validator(groq, gemini, "gm", "gem", self.groq_sem, self.gemini_sem, cluster))
         self.assertEqual(result.verdict, "confirmed")
         self.assertEqual(result.validator_family, "llama")
         self.assertTrue(result.comment_markdown)
+        self.assertEqual(usage.input_tokens, 10)
+        self.assertEqual(usage.output_tokens, 10)
 
     def test_groq_refusal_falls_back_to_gemini(self):
         cluster = make_cluster()
         groq = groq_client_with_responses([None])  # empty content -> refusal
         gemini = gemini_client_with_responses([confirmed_json(family="gemini")])
-        result = asyncio.run(run_validator(groq, gemini, "gm", "gem", self.groq_sem, self.gemini_sem, cluster))
+        result, usage = asyncio.run(run_validator(groq, gemini, "gm", "gem", self.groq_sem, self.gemini_sem, cluster))
         self.assertEqual(result.validator_family, "gemini")
         self.assertEqual(result.verdict, "confirmed")
 
@@ -84,7 +86,7 @@ class TestRunValidator(unittest.TestCase):
         good = confirmed_json(cluster_id="c1")
         groq = groq_client_with_responses([bad, good])
         gemini = gemini_client_with_responses([])
-        result = asyncio.run(run_validator(groq, gemini, "gm", "gem", self.groq_sem, self.gemini_sem, cluster))
+        result, usage = asyncio.run(run_validator(groq, gemini, "gm", "gem", self.groq_sem, self.gemini_sem, cluster))
         self.assertEqual(result.cluster_id, "c1")
         self.assertEqual(groq.chat.completions.create.await_count, 2)
 
@@ -96,7 +98,7 @@ class TestRunValidator(unittest.TestCase):
         })
         groq = groq_client_with_responses([bad] * 10)
         gemini = gemini_client_with_responses([])
-        result = asyncio.run(run_validator(groq, gemini, "gm", "gem", self.groq_sem, self.gemini_sem, cluster))
+        result, usage = asyncio.run(run_validator(groq, gemini, "gm", "gem", self.groq_sem, self.gemini_sem, cluster))
         self.assertEqual(result.verdict, "uncertain")
         self.assertEqual(result.cluster_id, cluster.cluster_id)
 
@@ -104,7 +106,7 @@ class TestRunValidator(unittest.TestCase):
         cluster = make_cluster()
         groq = groq_client_with_responses([None])
         gemini = gemini_client_with_responses([None])
-        result = asyncio.run(run_validator(groq, gemini, "gm", "gem", self.groq_sem, self.gemini_sem, cluster))
+        result, usage = asyncio.run(run_validator(groq, gemini, "gm", "gem", self.groq_sem, self.gemini_sem, cluster))
         self.assertEqual(result.verdict, "uncertain")
 
     def test_false_positive_verdict_allows_empty_comment(self):
@@ -115,7 +117,7 @@ class TestRunValidator(unittest.TestCase):
         })
         groq = groq_client_with_responses([raw])
         gemini = gemini_client_with_responses([])
-        result = asyncio.run(run_validator(groq, gemini, "gm", "gem", self.groq_sem, self.gemini_sem, cluster))
+        result, usage = asyncio.run(run_validator(groq, gemini, "gm", "gem", self.groq_sem, self.gemini_sem, cluster))
         self.assertEqual(result.verdict, "false_positive")
 
 
@@ -127,7 +129,7 @@ class TestRunAllValidators(unittest.TestCase):
     def test_empty_clusters_returns_empty(self):
         groq = groq_client_with_responses([])
         gemini = gemini_client_with_responses([])
-        result = asyncio.run(run_all_validators(groq, gemini, "gm", "gem", self.groq_sem, self.gemini_sem, []))
+        result, usage = asyncio.run(run_all_validators(groq, gemini, "gm", "gem", self.groq_sem, self.gemini_sem, []))
         self.assertEqual(result, [])
 
     def test_fans_out_over_multiple_clusters(self):
@@ -135,8 +137,11 @@ class TestRunAllValidators(unittest.TestCase):
         c2 = make_cluster("c2")
         groq = groq_client_with_responses([confirmed_json("c1"), confirmed_json("c2")])
         gemini = gemini_client_with_responses([])
-        results = asyncio.run(run_all_validators(groq, gemini, "gm", "gem", self.groq_sem, self.gemini_sem, [c1, c2]))
+        results, usage = asyncio.run(run_all_validators(groq, gemini, "gm", "gem", self.groq_sem, self.gemini_sem, [c1, c2]))
         self.assertEqual({r.cluster_id for r in results}, {"c1", "c2"})
+        # Both clusters' calls summed into one total.
+        self.assertEqual(usage.input_tokens, 20)
+        self.assertEqual(usage.output_tokens, 20)
 
 
 if __name__ == "__main__":

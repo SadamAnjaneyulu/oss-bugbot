@@ -21,9 +21,10 @@ def make_finding(**overrides):
     return Finding(**base)
 
 
-def gemini_response(text, finish_reason="STOP"):
+def gemini_response(text, finish_reason="STOP", prompt_tokens=15, response_tokens=25):
     candidate = SimpleNamespace(finish_reason=SimpleNamespace(value=finish_reason))
-    return SimpleNamespace(candidates=[candidate], text=text)
+    usage = SimpleNamespace(prompt_token_count=prompt_tokens, candidates_token_count=response_tokens)
+    return SimpleNamespace(candidates=[candidate], text=text, usage_metadata=usage)
 
 
 def make_client(responses):
@@ -70,7 +71,7 @@ class TestRunAggregation(unittest.TestCase):
         self.sem = asyncio.Semaphore(1)
 
     def test_empty_findings_returns_empty(self):
-        result, used_fallback = asyncio.run(run_aggregation(make_client([]), "m", self.sem, {}))
+        result, used_fallback, usage = asyncio.run(run_aggregation(make_client([]), "m", self.sem, {}))
         self.assertEqual(result, [])
         self.assertFalse(used_fallback)
 
@@ -81,9 +82,11 @@ class TestRunAggregation(unittest.TestCase):
             "merged": f1.model_dump(),
         }]})
         client = make_client([gemini_response(raw)])
-        clusters, used_fallback = asyncio.run(run_aggregation(client, "m", self.sem, {"p1": [f1]}, threshold=1))
+        clusters, used_fallback, usage = asyncio.run(run_aggregation(client, "m", self.sem, {"p1": [f1]}, threshold=1))
         self.assertEqual(len(clusters), 1)
         self.assertFalse(used_fallback)
+        self.assertEqual(usage.input_tokens, 15)
+        self.assertEqual(usage.output_tokens, 25)
 
     def test_threshold_filters_low_vote_clusters(self):
         f1 = make_finding()
@@ -92,7 +95,7 @@ class TestRunAggregation(unittest.TestCase):
             "merged": f1.model_dump(),
         }]})
         client = make_client([gemini_response(raw)])
-        clusters, _ = asyncio.run(run_aggregation(client, "m", self.sem, {"p1": [f1]}, threshold=2))
+        clusters, _, usage = asyncio.run(run_aggregation(client, "m", self.sem, {"p1": [f1]}, threshold=2))
         self.assertEqual(clusters, [])  # vote_count=1 < threshold=2
 
     def test_g2_retry_then_success(self):
@@ -106,10 +109,13 @@ class TestRunAggregation(unittest.TestCase):
             "merged": f1.model_dump(),
         }]})
         client = make_client([gemini_response(bad), gemini_response(good)])
-        clusters, used_fallback = asyncio.run(run_aggregation(client, "m", self.sem, {"p1": [f1]}, threshold=1))
+        clusters, used_fallback, usage = asyncio.run(run_aggregation(client, "m", self.sem, {"p1": [f1]}, threshold=1))
         self.assertEqual(len(clusters), 1)
         self.assertFalse(used_fallback)
         self.assertEqual(client.aio.models.generate_content.await_count, 2)
+        # Both attempts (rejected first, accepted second) counted, not just the last.
+        self.assertEqual(usage.input_tokens, 30)
+        self.assertEqual(usage.output_tokens, 50)
 
     def test_g2_exhausted_falls_back_to_deterministic(self):
         f1 = make_finding()
@@ -118,14 +124,14 @@ class TestRunAggregation(unittest.TestCase):
             "merged": f1.model_dump(),
         }]})
         client = make_client([gemini_response(always_bad)] * 10)
-        clusters, used_fallback = asyncio.run(run_aggregation(client, "m", self.sem, {"p1": [f1]}, threshold=1))
+        clusters, used_fallback, usage = asyncio.run(run_aggregation(client, "m", self.sem, {"p1": [f1]}, threshold=1))
         self.assertTrue(used_fallback)
         self.assertEqual(len(clusters), 1)  # deterministic path still clusters the one finding
 
     def test_safety_refusal_falls_back_to_deterministic(self):
         f1 = make_finding()
         client = make_client([gemini_response(None, finish_reason="SAFETY")])
-        clusters, used_fallback = asyncio.run(run_aggregation(client, "m", self.sem, {"p1": [f1]}, threshold=1))
+        clusters, used_fallback, usage = asyncio.run(run_aggregation(client, "m", self.sem, {"p1": [f1]}, threshold=1))
         self.assertTrue(used_fallback)
         self.assertEqual(len(clusters), 1)
 

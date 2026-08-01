@@ -73,6 +73,21 @@ class LLMResponse:
     provider: str
 
 
+@dataclass
+class TokenUsage:
+    """Shared accumulator for A2/A3 (and anything else that isn't A1's tool
+    loop, which has its own PassUsage in passes.py for the extra
+    tool_calls_used field). Retries burn real tokens too - callers must add
+    every attempt's usage, not just the attempt that ultimately validated.
+    """
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    def add(self, response: LLMResponse) -> None:
+        self.input_tokens += response.input_tokens
+        self.output_tokens += response.output_tokens
+
+
 async def call_gemini(
     client: genai.Client,
     model: str,

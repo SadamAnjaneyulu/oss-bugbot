@@ -187,16 +187,24 @@ async def _run_tool_loop(client, model: str, semaphore, root, diff_text: str, pa
             include_tools = False
 
 
-async def run_pass(client, model: str, semaphore, root, diff_text: str, pass_id: str, changed_lines: dict, deleted_files: set) -> ReviewerOutput | None:
+async def run_pass(client, model: str, semaphore, root, diff_text: str, pass_id: str, changed_lines: dict, deleted_files: set) -> tuple[ReviewerOutput | None, PassUsage]:
     """Runs one A1 pass end to end: tool loop -> G1 -> retry-same-node.
-    Returns None (never raises) on NodeExhausted - caller drops this pass
-    and recomputes the vote threshold over survivors. Degrade, never crash.
-    Caller is responsible for giving each pass a differently-ordered
-    diff_text (via diff.shuffle_hunks) - this function reviews whatever it
-    is given, in the order it is given.
+    Returns (None, usage) (never raises) on NodeExhausted - caller drops
+    this pass and recomputes the vote threshold over survivors. Degrade,
+    never crash. Caller is responsible for giving each pass a
+    differently-ordered diff_text (via diff.shuffle_hunks) - this function
+    reviews whatever it is given, in the order it is given.
+
+    usage sums every attempt including failed retries - a rejected attempt
+    still spent real tokens and tool calls.
     """
+    total_usage = PassUsage()
+
     async def agent_call(feedback: str | None):
         text, usage = await _run_tool_loop(client, model, semaphore, root, diff_text, pass_id)
+        total_usage.input_tokens += usage.input_tokens
+        total_usage.output_tokens += usage.output_tokens
+        total_usage.tool_calls_used += usage.tool_calls_used
         return text
 
     def validate_fn(raw_text: str) -> ReviewerOutput:
@@ -205,8 +213,9 @@ async def run_pass(client, model: str, semaphore, root, diff_text: str, pass_id:
         return output
 
     try:
-        return await run_with_retries(agent_call, validate_fn)
+        result = await run_with_retries(agent_call, validate_fn)
+        return result, total_usage
     except NodeExhausted:
-        return None
+        return None, total_usage
     except PassSafetyRefusal:
-        return None
+        return None, total_usage

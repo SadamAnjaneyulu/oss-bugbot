@@ -14,7 +14,7 @@ import json
 from google.genai import types as gtypes
 
 from gates import NodeExhausted, check_g2, run_with_retries
-from llm import SAFETY_FINISH_REASONS, SafetyRefusal
+from llm import SAFETY_FINISH_REASONS, LLMResponse, SafetyRefusal, TokenUsage
 from schemas import AggregatorOutput, Cluster, Finding, to_response_schema
 
 DEFAULT_VOTE_THRESHOLD = 2
@@ -40,7 +40,7 @@ def _findings_prompt(findings_by_pass: dict[str, list[Finding]]) -> str:
     return json.dumps(items, indent=2)
 
 
-async def _call_a2(client, model: str, semaphore, findings_by_pass: dict[str, list[Finding]], feedback: str | None) -> str:
+async def _call_a2(client, model: str, semaphore, findings_by_pass: dict[str, list[Finding]], feedback: str | None) -> LLMResponse:
     schema = to_response_schema(AggregatorOutput)
     user_text = _findings_prompt(findings_by_pass)
     if feedback:
@@ -65,7 +65,16 @@ async def _call_a2(client, model: str, semaphore, findings_by_pass: dict[str, li
         raise SafetyRefusal(f"gemini:{model} a2: finish_reason={finish_value}")
     if not response.text:
         raise SafetyRefusal(f"gemini:{model} a2: empty response")
-    return response.text
+
+    usage = response.usage_metadata
+    output_tokens = getattr(usage, "candidates_token_count", None) or getattr(usage, "response_token_count", None) or 0
+    return LLMResponse(
+        text=response.text,
+        input_tokens=getattr(usage, "prompt_token_count", 0) or 0,
+        output_tokens=output_tokens,
+        model=model,
+        provider="gemini",
+    )
 
 
 def _deterministic_cluster(findings_by_pass: dict[str, list[Finding]]) -> list[Cluster]:
@@ -110,17 +119,22 @@ async def run_aggregation(
     semaphore,
     findings_by_pass: dict[str, list[Finding]],
     threshold: int = DEFAULT_VOTE_THRESHOLD,
-) -> tuple[list[Cluster], bool]:
-    """Returns (surviving_clusters, used_deterministic_fallback). The bool
-    is for findings.json's degradation log - callers must not silently
-    publish deterministic-fallback results as if A2 succeeded.
+) -> tuple[list[Cluster], bool, TokenUsage]:
+    """Returns (surviving_clusters, used_deterministic_fallback, token_usage).
+    The bool is for findings.json's degradation log - callers must not
+    silently publish deterministic-fallback results as if A2 succeeded.
+    token_usage sums every attempt including failed retries - a rejected
+    attempt still spent real tokens.
     """
     valid_pass_ids = set(findings_by_pass.keys())
+    total_usage = TokenUsage()
     if not any(findings_by_pass.values()):
-        return [], False
+        return [], False, total_usage
 
     async def agent_call(feedback: str | None) -> str:
-        return await _call_a2(client, model, semaphore, findings_by_pass, feedback)
+        response = await _call_a2(client, model, semaphore, findings_by_pass, feedback)
+        total_usage.add(response)
+        return response.text
 
     def validate_fn(raw_text: str) -> AggregatorOutput:
         output = AggregatorOutput.model_validate_json(raw_text)
@@ -136,4 +150,4 @@ async def run_aggregation(
         used_fallback = True
 
     surviving = [c for c in clusters if c.vote_count >= threshold]
-    return surviving, used_fallback
+    return surviving, used_fallback, total_usage
