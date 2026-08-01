@@ -103,6 +103,65 @@ class TestMainMissingEnvVars(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
+class TestResolvePrInfo(unittest.TestCase):
+    def test_deleted_fork_raises_clear_value_error(self):
+        # GitHub returns head.repo: null when the PR's source fork/branch
+        # was deleted - a normal occurrence, not exotic. Must fail with a
+        # clear message, not a raw TypeError on data["head"]["repo"]["clone_url"].
+        import httpx as httpx_module
+
+        def handler(request):
+            return httpx_module.Response(200, json={"head": {"sha": "abc123", "ref": "feature", "repo": None}})
+
+        with patch("cli.httpx.AsyncClient", return_value=httpx_module.AsyncClient(transport=httpx_module.MockTransport(handler))):
+            with self.assertRaises(ValueError) as ctx:
+                asyncio.run(cli.resolve_pr_info("o", "r", 1, "tok"))
+        self.assertIn("deleted", str(ctx.exception))
+
+
+class TestMainErrorPaths(unittest.TestCase):
+    def _env(self):
+        return {"GITHUB_TOKEN": "t", "GEMINI_API_KEY": "g", "GROQ_API_KEY": "q"}
+
+    def test_deleted_fork_exits_cleanly_not_traceback(self):
+        test_args = ["cli.py", "--pr", "https://github.com/o/r/pull/1"]
+
+        async def fake_resolve(*a, **kw):
+            raise ValueError("PR #1's source repository has been deleted - nothing left to clone.")
+
+        with patch.object(sys, "argv", test_args), \
+             patch.dict("os.environ", self._env(), clear=True), \
+             patch("cli.resolve_pr_info", side_effect=fake_resolve):
+            code = cli.main()
+        self.assertEqual(code, 1)
+
+    def test_network_error_during_resolve_exits_cleanly(self):
+        import httpx as httpx_module
+        test_args = ["cli.py", "--pr", "https://github.com/o/r/pull/1"]
+
+        async def fake_resolve(*a, **kw):
+            raise httpx_module.ConnectError("connection failed")
+
+        with patch.object(sys, "argv", test_args), \
+             patch.dict("os.environ", self._env(), clear=True), \
+             patch("cli.resolve_pr_info", side_effect=fake_resolve):
+            code = cli.main()
+        self.assertEqual(code, 1)
+
+    def test_missing_git_binary_exits_cleanly(self):
+        test_args = ["cli.py", "--pr", "https://github.com/o/r/pull/1"]
+
+        async def fake_resolve(*a, **kw):
+            return {"head_sha": "abc", "head_clone_url": "https://x/y.git", "head_ref": "main"}
+
+        with patch.object(sys, "argv", test_args), \
+             patch.dict("os.environ", self._env(), clear=True), \
+             patch("cli.resolve_pr_info", side_effect=fake_resolve), \
+             patch("cli.clone_pr_branch", side_effect=FileNotFoundError("git not found")):
+            code = cli.main()
+        self.assertEqual(code, 1)
+
+
 class TestClonePrBranch(unittest.TestCase):
     def test_clone_timeout_reported_not_raised_uncaught(self):
         import subprocess as sp
