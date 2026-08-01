@@ -56,6 +56,15 @@ async def resolve_pr_info(owner: str, repo: str, pr_number: int, token: str) -> 
         )
         resp.raise_for_status()
         data = resp.json()
+
+    # GitHub returns head.repo: null whenever the PR's source fork/branch has
+    # since been deleted - a normal occurrence, not exotic. Fail with a clear
+    # message here rather than a raw TypeError three lines down.
+    if data["head"]["repo"] is None:
+        raise ValueError(
+            f"PR #{pr_number}'s source repository has been deleted - nothing left to clone."
+        )
+
     return {
         "head_sha": data["head"]["sha"],
         "head_clone_url": data["head"]["repo"]["clone_url"],
@@ -134,6 +143,12 @@ def main() -> int:
         print(f"Error: could not resolve PR ({exc.response.status_code}). "
               f"Check the URL and that your token can read this repo.", file=sys.stderr)
         return 1
+    except httpx.RequestError as exc:
+        print(f"Error: network request to GitHub failed: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
     with TemporaryDirectory(prefix="oss-bugbot-cli-") as tmp:
         checkout = Path(tmp)
@@ -146,6 +161,9 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             print(f"Error: clone exceeded {CLONE_TIMEOUT_SECONDS}s. This repo/branch is a poor fit "
                   f"for local CLI mode - use the Actions runtime instead.", file=sys.stderr)
+            return 1
+        except FileNotFoundError:
+            print("Error: git executable not found on PATH. Install git and try again.", file=sys.stderr)
             return 1
 
         print("Running review (calls Gemini and Groq - typically 20-60s)...")

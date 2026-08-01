@@ -1,8 +1,13 @@
 """Entrypoint the GitHub Action invokes. Wires every already-tested module
-into one pipeline run: gates -> diff -> static -> A1x4 -> A2 -> A3 -> post ->
-findings.json. See docs/prompts.md (once written) for the published system
-prompts, and the plan's "Agent + gate flow" diagram for the shape this
-mirrors exactly.
+into one pipeline run: size-gate -> diff -> static -> A1x4 -> A2 -> A3 ->
+post -> findings.json. See docs/prompts.md (once written) for the published
+system prompts, and the plan's "Agent + gate flow" diagram for the shape
+this mirrors.
+
+Note on naming: "size-gate" above is diff.py's size_gate (the only check
+that runs before the diff is fetched at all). gates.py's G1/G2/G3 are a
+different thing - they don't run as a standalone stage here, they're
+interleaved inside passes.py (G1), vote.py (G2), and validate.py (G3).
 """
 
 from __future__ import annotations
