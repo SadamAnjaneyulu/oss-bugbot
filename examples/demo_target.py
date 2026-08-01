@@ -7,4 +7,6 @@ first live trigger. Not part of the bot's own source (src/).
 
 def get_display_name(user_id, users_by_id):
     user = users_by_id.get(user_id)
+    if user is None:
+        return ""
     return user.name.strip()
