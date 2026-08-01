@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -165,6 +166,8 @@ class BugbotTUI(App):
         self.post = post
         self.completed_stages: list[str] = []
         self.running = False
+        self._stage_label = "[dim]Idle - paste a repo or PR link below[/]"
+        self._run_start: float | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -232,6 +235,19 @@ class BugbotTUI(App):
         self.run_worker(self.do_review(owner, repo, pr_number), exclusive=True)
 
     def _set_stage(self, text: str) -> None:
+        # Only the label changes here - _render_stage appends the live
+        # elapsed-seconds suffix on top of whatever label is current, so a
+        # long-running stage (a slow clone, a slow LLM call) still visibly
+        # ticks instead of sitting static for 60-120s looking frozen.
+        self._stage_label = text
+        self._render_stage()
+
+    def _render_stage(self) -> None:
+        if self.running and self._run_start is not None:
+            elapsed = int(time.monotonic() - self._run_start)
+            text = f"{self._stage_label} [dim]({elapsed}s)[/]"
+        else:
+            text = self._stage_label
         self.query_one("#stage", Static).update(text)
 
     def on_progress(self, stage: str, detail: str) -> None:
@@ -245,67 +261,66 @@ class BugbotTUI(App):
     async def do_review(self, owner: str, repo: str, pr_number: int) -> None:
         self.running = True
         self.completed_stages = []
-        self.query_one("#checklist", Static).update("")
+        self.query_one("#checklist", Static).update("[dim]Starting...[/]")
+        self._run_start = time.monotonic()
+        ticker = self.set_interval(1.0, self._render_stage)
         log = self.query_one("#log", RichLog)
-        self._set_stage(f"[bold cyan]Resolving[/] {owner}/{repo}#{pr_number}...")
 
         try:
-            info = await cli.resolve_pr_info(owner, repo, pr_number, self.github_token)
-        except httpx.HTTPStatusError as exc:
-            log.write(f"[bold red]Error:[/] could not resolve PR ({exc.response.status_code}).")
-            self.running = False
-            self._set_stage("[dim]Idle[/]")
-            return
-        except (httpx.RequestError, ValueError) as exc:
-            log.write(f"[bold red]Error:[/] {exc}")
-            self.running = False
-            self._set_stage("[dim]Idle[/]")
-            return
-        log.write(f"[green][OK][/] Resolved [bold]{info['head_ref']}[/] @ [dim]{info['head_sha'][:7]}[/]")
-
-        with TemporaryDirectory(prefix="oss-bugbot-tui-") as tmp:
-            checkout = Path(tmp)
-            self._set_stage(f"[bold cyan]Cloning[/] {info['head_ref']}...")
+            self._set_stage(f"[bold cyan]Resolving[/] {owner}/{repo}#{pr_number}...")
             try:
-                await asyncio.to_thread(cli.clone_pr_branch, info["head_clone_url"], info["head_ref"], checkout)
-            except subprocess.CalledProcessError as exc:
-                log.write(f"[bold red]Error:[/] clone failed:\n{exc.stderr}")
-                self.running = False
-                self._set_stage("[dim]Idle[/]")
+                info = await cli.resolve_pr_info(owner, repo, pr_number, self.github_token)
+            except httpx.HTTPStatusError as exc:
+                log.write(f"[bold red]Error:[/] could not resolve PR ({exc.response.status_code}).")
                 return
-            except subprocess.TimeoutExpired:
-                log.write(f"[bold red]Error:[/] clone exceeded {cli.CLONE_TIMEOUT_SECONDS}s.")
-                self.running = False
-                self._set_stage("[dim]Idle[/]")
+            except (httpx.RequestError, ValueError) as exc:
+                log.write(f"[bold red]Error:[/] {exc}")
                 return
-            except FileNotFoundError:
-                log.write("[bold red]Error:[/] git executable not found on PATH.")
-                self.running = False
-                self._set_stage("[dim]Idle[/]")
-                return
-            log.write("[green][OK][/] Cloned")
+            log.write(f"[green][OK][/] Resolved [bold]{info['head_ref']}[/] @ [dim]{info['head_sha'][:7]}[/]")
 
-            post_this_run = False
-            if self.post:
-                post_this_run = await self.push_screen_wait(ConfirmPostScreen(owner, repo, pr_number))
-                log.write("[dim]Posting for real this run[/]" if post_this_run else "[dim]Dry run (declined)[/]")
+            with TemporaryDirectory(prefix="oss-bugbot-tui-") as tmp:
+                checkout = Path(tmp)
+                self._set_stage(
+                    f"[bold cyan]Cloning[/] {info['head_ref']} "
+                    f"[dim](up to {cli.CLONE_TIMEOUT_SECONDS}s for a large repo)[/]..."
+                )
+                try:
+                    await asyncio.to_thread(cli.clone_pr_branch, info["head_clone_url"], info["head_ref"], checkout)
+                except subprocess.CalledProcessError as exc:
+                    log.write(f"[bold red]Error:[/] clone failed:\n{exc.stderr}")
+                    return
+                except subprocess.TimeoutExpired:
+                    log.write(f"[bold red]Error:[/] clone exceeded {cli.CLONE_TIMEOUT_SECONDS}s. "
+                              f"This repo/branch is too large for local CLI mode - try a smaller PR.")
+                    return
+                except FileNotFoundError:
+                    log.write("[bold red]Error:[/] git executable not found on PATH.")
+                    return
+                log.write("[green][OK][/] Cloned")
 
-            result = await run_review(
-                owner, repo, pr_number, info["head_sha"], self.github_token,
-                self.gemini_api_key, self.groq_api_key, checkout, post=post_this_run,
-                on_progress=self.on_progress,
+                post_this_run = False
+                if self.post:
+                    post_this_run = await self.push_screen_wait(ConfirmPostScreen(owner, repo, pr_number))
+                    log.write("[dim]Posting for real this run[/]" if post_this_run else "[dim]Dry run (declined)[/]")
+
+                result = await run_review(
+                    owner, repo, pr_number, info["head_sha"], self.github_token,
+                    self.gemini_api_key, self.groq_api_key, checkout, post=post_this_run,
+                    on_progress=self.on_progress,
+                )
+
+            Path("findings.json").write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+            for renderable in _findings_renderables(result):
+                log.write(renderable)
+
+            tokens = result.get("token_usage", {})
+            self.query_one("#tokens", Static).update(
+                f"[bold]{tokens.get('total_tokens', 0)}[/] tokens\n[dim]$0.00 (free tier)[/]"
             )
-
-        Path("findings.json").write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
-        for renderable in _findings_renderables(result):
-            log.write(renderable)
-
-        tokens = result.get("token_usage", {})
-        self.query_one("#tokens", Static).update(
-            f"[bold]{tokens.get('total_tokens', 0)}[/] tokens\n[dim]$0.00 (free tier)[/]"
-        )
-        self._set_stage("[dim]Idle - paste another link, or 'exit'[/]")
-        self.running = False
+        finally:
+            ticker.stop()
+            self.running = False
+            self._set_stage("[dim]Idle - paste another link, or 'exit'[/]")
 
 
 def main() -> int:
