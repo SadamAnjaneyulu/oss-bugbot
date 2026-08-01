@@ -238,6 +238,81 @@ class TestRunReviewHappyPath(unittest.TestCase):
         self.assertEqual(posted_comments, [])  # false_positive finding never becomes a comment
         self.assertFalse(result["post_result"]["posted"])
 
+    def test_on_progress_fires_at_every_stage_including_each_a1_pass(self):
+        # The TUI's whole live-progress feature rests on this: on_progress
+        # must fire once per individual A1 pass (not once for the batch),
+        # plus once each for the other five stage transitions.
+        files = [FileMeta("app.py", "modified", 2, 1, 3)]
+        diff_text = (
+            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+            "@@ -1,1 +1,2 @@\n def f():\n+    return None\n"
+        )
+        finding = Finding(
+            file="app.py", line=2, category="logic", severity="high", title="bug",
+            reasoning="x", evidence_lines=[2], self_confidence=0.8,
+        )
+        pass_result = type("R", (), {"findings": [finding]})()
+        cluster = Cluster(cluster_id="c1", vote_count=4, supporting_pass_ids=["p1", "p2", "p3", "p4"], merged=finding)
+        verdict = ValidatorOutput(
+            cluster_id="c1", verdict="confirmed", refutation="none",
+            validator_family="llama", validator_confidence=0.9, comment_markdown="**Bug**: real",
+        )
+
+        async def fake_fetch_pr_files(*a, **kw):
+            return files
+
+        async def fake_fetch_diff(*a, **kw):
+            return diff_text
+
+        async def fake_run_pass(*a, **kw):
+            return pass_result, PassUsage(input_tokens=10, output_tokens=20, tool_calls_used=1)
+
+        async def fake_run_aggregation(*a, **kw):
+            return [cluster], False, TokenUsage(input_tokens=5, output_tokens=15)
+
+        async def fake_run_all_validators(*a, **kw):
+            return [verdict], TokenUsage(input_tokens=8, output_tokens=12)
+
+        async def fake_fetch_existing_markers(*a, **kw):
+            return set()
+
+        async def fake_post_review(*a, **kw):
+            return {"posted": True, "fallback": False, "count": len(a[-1])}
+
+        events = []
+
+        with TemporaryDirectory() as tmp, \
+             patch("main.fetch_pr_files", side_effect=fake_fetch_pr_files), \
+             patch("main.fetch_diff", side_effect=fake_fetch_diff), \
+             patch("main.run_semgrep", return_value={}), \
+             patch("main.run_pass", side_effect=fake_run_pass), \
+             patch("main.run_aggregation", side_effect=fake_run_aggregation), \
+             patch("main.run_all_validators", side_effect=fake_run_all_validators), \
+             patch("main.fetch_existing_markers", side_effect=fake_fetch_existing_markers), \
+             patch("main.post_review", side_effect=fake_post_review), \
+             patch("main.genai.Client"), patch("main.AsyncGroq"):
+            asyncio.run(main.run_review(
+                "o", "r", 1, "sha", "tok", "gk", "qk", Path(tmp),
+                on_progress=lambda stage, detail: events.append(stage),
+            ))
+
+        self.assertEqual(events.count("a1_pass_done"), 4)
+        for stage in ("size_gate", "diff_fetched", "semgrep_done", "a2_done", "a3_done", "posted"):
+            self.assertIn(stage, events)
+
+    def test_on_progress_defaults_to_none_with_zero_behavior_change(self):
+        # Every existing caller (review.yml's main(), every other test in
+        # this file) omits on_progress entirely - it must be a true no-op.
+        big_files = [FileMeta(f"f{i}.py", "modified", 100, 0, 100) for i in range(10)]
+
+        async def fake_fetch_pr_files(*a, **kw):
+            return big_files
+
+        with patch("main.fetch_pr_files", side_effect=fake_fetch_pr_files):
+            result = asyncio.run(main.run_review("o", "r", 1, "sha", "tok", "gk", "qk", Path(".")))
+
+        self.assertTrue(result["skipped"])
+
 
 if __name__ == "__main__":
     unittest.main()

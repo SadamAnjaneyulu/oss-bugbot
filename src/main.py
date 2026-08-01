@@ -17,6 +17,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Callable
 
 import httpx
 from google import genai
@@ -59,9 +60,22 @@ def compute_score(vote_count: int, passes_surviving: int, verdict: str) -> float
     return wilson_lower_bound(vote_count, passes_surviving) * VALIDATOR_WEIGHT.get(verdict, 0.0)
 
 
+async def _with_progress(coro, stage: str, detail: str, on_progress):
+    """Fires on_progress the moment this ONE coroutine finishes, not when
+    the whole gather() batch finishes - that's the difference between real
+    per-pass live progress and a fake "done" that only fires once
+    everything is already done.
+    """
+    result = await coro
+    if on_progress:
+        on_progress(stage, detail)
+    return result
+
+
 async def run_review(
     owner: str, repo: str, pr_number: int, head_sha: str, github_token: str,
     gemini_api_key: str, groq_api_key: str, root: Path, post: bool = True,
+    on_progress: Callable[[str, str], None] | None = None,
 ) -> dict:
     """Returns the findings.json-shaped dict. Never raises for expected
     conditions (oversize PR, refusals, gate exhaustion) - those are all
@@ -72,13 +86,23 @@ async def run_review(
     can point at any public PR a token can reach, defaults ITS flag the
     other way - dry-run unless --post is passed explicitly. A tool that can
     be pointed at a stranger's real PR should not post there by default.
+
+    on_progress(stage, detail): optional, called at each observable stage
+    transition (fetch/gate/semgrep/each A1 pass/A2/A3/post) - purely for
+    a caller that wants to render live progress (the TUI). None by default,
+    zero behavior change for review.yml or any existing caller/test.
     """
     degradations: list[dict] = []
     skipped_files: list[str] = []
 
+    def progress(stage: str, detail: str = "") -> None:
+        if on_progress:
+            on_progress(stage, detail)
+
     async with httpx.AsyncClient(timeout=30.0) as http_client:
         files = await fetch_pr_files(http_client, owner, repo, pr_number, github_token)
         gate = size_gate(files, MAX_LINES, MAX_FILES)
+        progress("size_gate", "ok" if gate.ok else gate.reason)
 
         if not gate.ok:
             return {
@@ -93,6 +117,7 @@ async def run_review(
         skipped_files.extend(sorted(skippable))
 
         diff_text = await fetch_diff(http_client, owner, repo, pr_number, github_token, files_fallback=files)
+        progress("diff_fetched", f"{len(diff_text)} bytes")
         if not diff_text.strip():
             return {
                 "schema_version": SCHEMA_VERSION, "pr": pr_number,
@@ -106,6 +131,7 @@ async def run_review(
         reviewable_files = [f for f in changed_lines if f not in deleted]
 
         semgrep_hits = run_semgrep(root, reviewable_files)
+        progress("semgrep_done", f"{sum(len(v) for v in semgrep_hits.values())} hits")
 
     gemini_client = genai.Client(api_key=gemini_api_key)
     groq_client = AsyncGroq(api_key=groq_api_key)
@@ -113,7 +139,10 @@ async def run_review(
     # --- A1: NUM_PASSES concurrent passes, each a differently-shuffled diff
     pass_diffs = [shuffle_hunks(diff_text, seed=i) for i in range(NUM_PASSES)]
     pass_results = await asyncio.gather(*[
-        run_pass(gemini_client, GEMINI_FLASH_LITE, GEMINI_FLASH_LITE_SEM, root, pass_diffs[i], f"p{i + 1}", changed_lines, deleted)
+        _with_progress(
+            run_pass(gemini_client, GEMINI_FLASH_LITE, GEMINI_FLASH_LITE_SEM, root, pass_diffs[i], f"p{i + 1}", changed_lines, deleted),
+            "a1_pass_done", f"p{i + 1}", on_progress,
+        )
         for i in range(NUM_PASSES)
     ])
 
@@ -148,6 +177,7 @@ async def run_review(
     a2_calls += 1
     if used_deterministic_clustering:
         degradations.append({"node": "a2", "action": "deterministic_clustering_fallback"})
+    progress("a2_done", f"{len(clusters)} clusters")
 
     # --- A3: adversarial validation, fanned out
     verdicts, a3_usage = await run_all_validators(
@@ -156,6 +186,7 @@ async def run_review(
     total_usage.input_tokens += a3_usage.input_tokens
     total_usage.output_tokens += a3_usage.output_tokens
     a3_calls += len(clusters)
+    progress("a3_done", f"{len(verdicts)} verdicts")
     for v in verdicts:
         if v.validator_family != "llama":
             degradations.append({"node": "a3", "cluster_id": v.cluster_id, "action": "same_family_fallback_used"})
@@ -187,6 +218,7 @@ async def run_review(
             post_result = await post_review(http_client, owner, repo, pr_number, github_token, head_sha, to_post)
         else:
             post_result = {"posted": False, "reason": "dry_run", "count": len(to_post), "fallback": False}
+    progress("posted", str(post_result.get("count", 0)))
 
     return {
         "schema_version": SCHEMA_VERSION,

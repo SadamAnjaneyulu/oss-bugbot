@@ -130,11 +130,29 @@ Stated before any benchmark exists, not after a bad result:
 ## Local CLI mode
 
 The GitHub Actions workflow above is the production runtime — it only runs on repos
-where it's installed. For local development, demos, and the eval harness, there's a
-second entrypoint, [`src/cli.py`](src/cli.py), that points the same pipeline (identical
-A1/A2/A3/gates code, nothing duplicated) at **any public PR by URL**.
+where it's installed. For local development, demos, and the eval harness, there are
+two local entrypoints. Both point the same pipeline (identical A1/A2/A3/gates code,
+nothing duplicated) at **any public PR by URL**.
 
-Interactive session (launch once, paste PR URLs in, keep going):
+**[`src/tui.py`](src/tui.py)** — a persistent split-pane app (built on
+[`textual`](https://github.com/Textualize/textual)): a live log pane on the left, a
+sidebar on the right with a running checklist of pipeline stages and token totals, and
+a persistent input at the bottom for pasting repo or PR links. Stays open across runs —
+paste another link when one finishes.
+
+```bash
+python src/tui.py
+```
+
+Progress is genuinely live, not a fake spinner: `main.run_review`'s optional
+`on_progress(stage, detail)` callback fires the instant each individual A1 pass
+finishes (not when the whole 4-pass batch finishes), plus once each for the size gate,
+diff fetch, semgrep, A2, A3, and post — see [`tests/test_main.py`](tests/test_main.py)'s
+`test_on_progress_fires_at_every_stage_including_each_a1_pass`, which asserts the four
+A1 events actually arrive as four separate events, not one.
+
+**[`src/cli.py`](src/cli.py)** — the simpler print-and-scroll interactive session, for
+scripting or when a full TUI is overkill:
 
 ```bash
 python src/cli.py
@@ -212,7 +230,7 @@ python -m unittest discover -s tests
 
 ## Status
 
-Phase 1 (build) substantially complete, Phase 3 (eval) started. 210 tests, all green,
+Phase 1 (build) substantially complete, Phase 3 (eval) started. 236 tests, all green,
 including live-verified round trips against both Gemini and Groq — not mocked; see
 commit history for real provider-behavior bugs the live checks caught that mocking
 alone would have missed, one real "pwn request" checkout-ordering vulnerability fixed

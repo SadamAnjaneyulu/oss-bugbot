@@ -6,3 +6,4 @@ semgrep
 google-genai
 groq
 rich
+textual
