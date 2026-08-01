@@ -1,0 +1,52 @@
+rules:
+  - id: ts-loose-equality
+    languages: [typescript, javascript]
+    severity: INFO
+    message: >-
+      == / != performs type coercion before comparing. Frequently the actual
+      bug behind "works for some inputs but not others".
+    patterns:
+      - pattern-either:
+          - pattern: $A == $B
+          - pattern: $A != $B
+      - metavariable-comparison:
+          metavariable: $B
+          comparison: $B != "null"
+
+  - id: ts-eval-usage
+    languages: [typescript, javascript]
+    severity: WARNING
+    message: >-
+      eval() on non-literal input is a code-injection risk.
+      Corroborating evidence only -- A1 makes the final call.
+    pattern: eval(...)
+
+  - id: ts-unhandled-promise
+    languages: [typescript, javascript]
+    severity: INFO
+    message: >-
+      Promise-returning call with no await, .then, or .catch -- rejections
+      vanish silently. Frequently the actual bug behind "sometimes it just
+      doesn't run".
+    patterns:
+      - pattern: $FUNC(...);
+      - metavariable-regex:
+          metavariable: $FUNC
+          regex: ^(fetch|axios\.\w+)$
+
+  - id: ts-hardcoded-secret-assignment
+    languages: [typescript, javascript]
+    severity: WARNING
+    message: >-
+      Variable name suggests a credential assigned to a string literal.
+      Corroborating evidence only.
+    patterns:
+      - pattern-regex: (?i)(api[_-]?key|secret|password|token)\s*[:=]\s*["'][A-Za-z0-9_\-]{8,}["']
+
+  - id: ts-any-type-assertion
+    languages: [typescript]
+    severity: INFO
+    message: >-
+      Casting to `any` discards type-checking for this value -- frequently
+      papers over a real type mismatch rather than fixing it.
+    pattern: $EXPR as any

@@ -1,0 +1,57 @@
+rules:
+  - id: py-eval-exec-on-input
+    languages: [python]
+    severity: WARNING
+    message: >-
+      eval()/exec() on a value that may originate outside this function is a
+      code-injection risk. Corroborating evidence only -- A1 makes the final call.
+    patterns:
+      - pattern-either:
+          - pattern: eval(...)
+          - pattern: exec(...)
+
+  - id: py-subprocess-shell-true
+    languages: [python]
+    severity: WARNING
+    message: >-
+      subprocess call with shell=True passes the command through a shell,
+      turning any unsanitized input into command injection.
+    pattern-either:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+      - pattern: subprocess.$FUNC($CMD, shell=True)
+
+  - id: py-hardcoded-secret-assignment
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Variable name suggests a credential assigned to a string literal.
+      Corroborating evidence only.
+    patterns:
+      - pattern-regex: (?i)(api[_-]?key|secret|password|token)\s*=\s*["'][A-Za-z0-9_\-]{8,}["']
+
+  - id: py-bare-except
+    languages: [python]
+    severity: INFO
+    message: >-
+      Bare except swallows all exceptions including KeyboardInterrupt/SystemExit,
+      and hides the real failure.
+    pattern: |
+      try:
+          ...
+      except:
+          ...
+
+  - id: py-mutable-default-arg
+    languages: [python]
+    severity: INFO
+    message: >-
+      Mutable default argument is shared across all calls -- classic Python
+      footgun, frequently the actual bug behind "state leaking between requests".
+    patterns:
+      - pattern-either:
+          - pattern: |
+              def $FUNC(..., $ARG=[], ...):
+                  ...
+          - pattern: |
+              def $FUNC(..., $ARG={}, ...):
+                  ...
