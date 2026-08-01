@@ -20,7 +20,7 @@ def make_cluster(cluster_id="c1"):
     return Cluster(cluster_id=cluster_id, vote_count=2, supporting_pass_ids=["p1", "p2"], merged=f)
 
 
-def groq_client_with_responses(contents, finish_reasons=None):
+def _openai_client_with_responses(contents, finish_reasons=None):
     finish_reasons = finish_reasons or ["stop"] * len(contents)
     responses = []
     for content, fr in zip(contents, finish_reasons):
@@ -33,16 +33,11 @@ def groq_client_with_responses(contents, finish_reasons=None):
     return client
 
 
-def gemini_client_with_responses(texts, finish_reasons=None):
-    finish_reasons = finish_reasons or ["STOP"] * len(texts)
-    responses = []
-    for text, fr in zip(texts, finish_reasons):
-        candidate = SimpleNamespace(finish_reason=SimpleNamespace(value=fr))
-        usage = SimpleNamespace(prompt_token_count=10, candidates_token_count=10)
-        responses.append(SimpleNamespace(candidates=[candidate], text=text, usage_metadata=usage))
-    client = MagicMock()
-    client.aio.models.generate_content = AsyncMock(side_effect=responses)
-    return client
+# Both providers speak the same OpenAI-compatible wire shape now - primary
+# and fallback clients are built identically, just aliased for readability
+# at each call site.
+groq_client_with_responses = _openai_client_with_responses
+gemini_client_with_responses = _openai_client_with_responses
 
 
 def confirmed_json(cluster_id="c1", family="llama"):

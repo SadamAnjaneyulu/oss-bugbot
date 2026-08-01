@@ -21,15 +21,16 @@ def make_finding(**overrides):
     return Finding(**base)
 
 
-def gemini_response(text, finish_reason="STOP", prompt_tokens=15, response_tokens=25):
-    candidate = SimpleNamespace(finish_reason=SimpleNamespace(value=finish_reason))
-    usage = SimpleNamespace(prompt_token_count=prompt_tokens, candidates_token_count=response_tokens)
-    return SimpleNamespace(candidates=[candidate], text=text, usage_metadata=usage)
+def openai_response(content, finish_reason="stop", prompt_tokens=15, completion_tokens=25):
+    message = SimpleNamespace(content=content)
+    choice = SimpleNamespace(message=message, finish_reason=finish_reason)
+    usage = SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+    return SimpleNamespace(choices=[choice], usage=usage)
 
 
 def make_client(responses):
     client = MagicMock()
-    client.aio.models.generate_content = AsyncMock(side_effect=responses)
+    client.chat.completions.create = AsyncMock(side_effect=responses)
     return client
 
 
@@ -81,7 +82,7 @@ class TestRunAggregation(unittest.TestCase):
             "cluster_id": "c1", "vote_count": 1, "supporting_pass_ids": ["p1"],
             "merged": f1.model_dump(),
         }]})
-        client = make_client([gemini_response(raw)])
+        client = make_client([openai_response(raw)])
         clusters, used_fallback, usage = asyncio.run(run_aggregation(client, "m", self.sem, {"p1": [f1]}, threshold=1))
         self.assertEqual(len(clusters), 1)
         self.assertFalse(used_fallback)
@@ -94,7 +95,7 @@ class TestRunAggregation(unittest.TestCase):
             "cluster_id": "c1", "vote_count": 1, "supporting_pass_ids": ["p1"],
             "merged": f1.model_dump(),
         }]})
-        client = make_client([gemini_response(raw)])
+        client = make_client([openai_response(raw)])
         clusters, _, usage = asyncio.run(run_aggregation(client, "m", self.sem, {"p1": [f1]}, threshold=2))
         self.assertEqual(clusters, [])  # vote_count=1 < threshold=2
 
@@ -108,11 +109,11 @@ class TestRunAggregation(unittest.TestCase):
             "cluster_id": "c1", "vote_count": 1, "supporting_pass_ids": ["p1"],
             "merged": f1.model_dump(),
         }]})
-        client = make_client([gemini_response(bad), gemini_response(good)])
+        client = make_client([openai_response(bad), openai_response(good)])
         clusters, used_fallback, usage = asyncio.run(run_aggregation(client, "m", self.sem, {"p1": [f1]}, threshold=1))
         self.assertEqual(len(clusters), 1)
         self.assertFalse(used_fallback)
-        self.assertEqual(client.aio.models.generate_content.await_count, 2)
+        self.assertEqual(client.chat.completions.create.await_count, 2)
         # Both attempts (rejected first, accepted second) counted, not just the last.
         self.assertEqual(usage.input_tokens, 30)
         self.assertEqual(usage.output_tokens, 50)
@@ -123,14 +124,14 @@ class TestRunAggregation(unittest.TestCase):
             "cluster_id": "c1", "vote_count": 1, "supporting_pass_ids": ["ghost"],
             "merged": f1.model_dump(),
         }]})
-        client = make_client([gemini_response(always_bad)] * 10)
+        client = make_client([openai_response(always_bad)] * 10)
         clusters, used_fallback, usage = asyncio.run(run_aggregation(client, "m", self.sem, {"p1": [f1]}, threshold=1))
         self.assertTrue(used_fallback)
         self.assertEqual(len(clusters), 1)  # deterministic path still clusters the one finding
 
     def test_safety_refusal_falls_back_to_deterministic(self):
         f1 = make_finding()
-        client = make_client([gemini_response(None, finish_reason="SAFETY")])
+        client = make_client([openai_response(None, finish_reason="content_filter")])
         clusters, used_fallback, usage = asyncio.run(run_aggregation(client, "m", self.sem, {"p1": [f1]}, threshold=1))
         self.assertTrue(used_fallback)
         self.assertEqual(len(clusters), 1)

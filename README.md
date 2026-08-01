@@ -51,6 +51,7 @@ instead of GitHub Actions.
 - [Architecture](#architecture)
 - [Known failure modes](#known-failure-modes)
 - [Local CLI mode](#local-cli-mode)
+- [Web UI](#web-ui)
 - [Setup (GitHub Actions)](#setup-github-actions--the-production-runtime)
 - [Status](#status)
 
@@ -204,6 +205,51 @@ export GROQ_API_KEY=your-groq-key
 python src/cli.py --pr https://github.com/owner/repo/pull/123
 ```
 
+## Web UI
+
+A third entrypoint, [`web/`](web/) — a public web version, for anyone who'd rather
+click a link than clone a repo. Same pipeline underneath, same `run_review()`, nothing
+duplicated. Two pieces:
+
+- [`web/backend/`](web/backend/) — a small FastAPI app with one `/ws/review` WebSocket
+  endpoint. It streams live stage-by-stage progress (the same events `src/tui.py`
+  consumes) to the browser as JSON.
+- [`web/frontend/`](web/frontend/) — a React + Vite + Tailwind + Framer Motion page:
+  a link input, an animated step-by-step progress list, and a findings view.
+
+**Bring your own provider.** Every visitor enters their own GitHub token and their own
+choice of LLM provider — any OpenAI-compatible endpoint (base URL + API key + model),
+not just Gemini/Groq: OpenAI, Groq, Together, Fireworks, DeepSeek, OpenRouter, local
+Ollama, or Gemini's own OpenAI-compat layer. The form groups this as "Reviewer" (A1+A2)
+and "Validator" (A3 primary + optional fallback) — a different provider for the
+validator is recommended, for genuine adversarial independence, not required. Nothing
+is stored anywhere but the visitor's own browser (`localStorage`), sent once per review
+straight to the backend, never logged or persisted server-side. This is deliberate, not
+a limitation: a public page with one shared set of keys would let any stranger drain
+this project's own quota with zero rate limit. With bring-your-own-provider, there's no
+shared secret to drain — worst case, a visitor burns through their own quota.
+
+Run it locally:
+
+```bash
+cd web/backend && pip install -r requirements.txt && uvicorn app:app --reload
+# separate terminal
+cd web/frontend && npm install && npm run dev
+```
+
+Then open the printed `localhost` URL, fill in your provider keys, paste a PR or repo
+link (same [`SadamAnjaneyulu/oss-bugbot#2`](https://github.com/SadamAnjaneyulu/oss-bugbot/pull/2)
+demo PR works here too), and watch it run.
+
+**Deploying it** (both free, both need a real account — this repo won't set those up
+for you): backend to [Render](https://render.com) as a Docker web service (build context
+= repo root, Dockerfile path `web/backend/Dockerfile` — it needs `git` on the image,
+so a Docker deploy, not a buildpack), frontend to [Vercel](https://vercel.com) (zero-config
+for a Vite build, set `VITE_BACKEND_URL` to the deployed Render URL). Known, stated
+limitation: Render's free tier sleeps after 15 minutes idle, so the first request after
+a lull takes 30-60s to wake up — the same "live-verify honestly, don't hide known
+limitations" stance as the [Known failure modes](#known-failure-modes) section above.
+
 ## Setup (GitHub Actions — the production runtime)
 
 ```bash
@@ -236,7 +282,8 @@ python -m unittest discover -s tests
 
 ## Status
 
-Phase 1 (build) substantially complete, Phase 3 (eval) started. 236 tests, all green,
+Phase 1 (build) substantially complete, Phase 3 (eval) started. 238 Python tests, all
+green, plus 3 backend WebSocket tests and 4 frontend reducer tests for the web UI —
 including live-verified round trips against both Gemini and Groq — not mocked; see
 commit history for real provider-behavior bugs the live checks caught that mocking
 alone would have missed, one real "pwn request" checkout-ordering vulnerability fixed

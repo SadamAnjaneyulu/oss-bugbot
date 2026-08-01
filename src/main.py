@@ -20,14 +20,15 @@ from pathlib import Path
 from typing import Callable
 
 import httpx
-from google import genai
-from groq import AsyncGroq
 
 from diff import (
     MAX_FILES, MAX_LINES, deleted_filenames, fetch_diff, fetch_pr_files,
     is_skippable_file, parse_changed_lines, shuffle_hunks, size_gate,
 )
-from llm import GEMINI_FLASH, GEMINI_FLASH_LITE, GROQ_PRIMARY, MODEL_RESOLUTION_DATE, TokenUsage
+from llm import (
+    GEMINI_FLASH, GEMINI_FLASH_LITE, GEMINI_OPENAI_COMPAT_BASE_URL, GROQ_OPENAI_COMPAT_BASE_URL,
+    GROQ_PRIMARY, MODEL_RESOLUTION_DATE, ProviderConfig, TokenUsage, make_client,
+)
 from passes import NUM_PASSES, run_pass
 from post import build_review_comments, fetch_existing_markers, post_review
 from static import is_corroborated, run_semgrep
@@ -38,12 +39,35 @@ from stats import wilson_lower_bound
 SCHEMA_VERSION = "1.0"
 VALIDATOR_WEIGHT = {"confirmed": 1.0, "uncertain": 0.4, "false_positive": 0.0}
 
-# Soft pre-emptive caps - see llm.py RATE_LIMITS docstring: neither provider
-# publishes a permanently fixed free-tier table anymore, these are a
-# starting point, not a guarantee. 429s are the authoritative signal.
-GEMINI_FLASH_LITE_SEM = asyncio.Semaphore(int(os.environ.get("GEMINI_FLASH_LITE_RPM", 15)))
-GEMINI_FLASH_SEM = asyncio.Semaphore(int(os.environ.get("GEMINI_FLASH_RPM", 10)))
-GROQ_SEM = asyncio.Semaphore(1)  # plan: TPM ceiling trips under any real concurrency
+# Soft pre-emptive caps - see llm.py RATE_LIMITS docstring: neither Gemini
+# nor Groq publishes a permanently fixed free-tier table, these are a
+# starting point, not a guarantee. 429s are the authoritative signal. An
+# arbitrary visitor-supplied provider has no known limit up front, so these
+# generic (role-based, not provider-named) defaults apply to it too -
+# conservative enough not to be the first thing that breaks.
+A1_SEM = asyncio.Semaphore(int(os.environ.get("A1_RPM", 15)))
+A2_SEM = asyncio.Semaphore(int(os.environ.get("A2_RPM", 10)))
+A3_PRIMARY_SEM = asyncio.Semaphore(int(os.environ.get("A3_PRIMARY_RPM", 1)))  # tight TPM ceilings trip under concurrency
+A3_FALLBACK_SEM = asyncio.Semaphore(int(os.environ.get("A3_FALLBACK_RPM", 10)))
+
+
+def default_provider_configs_from_env() -> tuple[ProviderConfig, ProviderConfig, ProviderConfig, ProviderConfig] | None:
+    """Zero-config default: if GEMINI_API_KEY and GROQ_API_KEY are set (the
+    only two secrets review.yml has ever configured), route through their
+    OpenAI-compat endpoints with the same model split as before the pipeline
+    went provider-agnostic. Returns None if either is missing - callers
+    decide how to fail (main() raises a clear error; cli.py/tui.py do the
+    same as they already did for a missing env var).
+    """
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    groq_key = os.environ.get("GROQ_API_KEY")
+    if not (gemini_key and groq_key):
+        return None
+    a1 = ProviderConfig(GEMINI_OPENAI_COMPAT_BASE_URL, gemini_key, GEMINI_FLASH_LITE)
+    a2 = ProviderConfig(GEMINI_OPENAI_COMPAT_BASE_URL, gemini_key, GEMINI_FLASH)
+    a3_primary = ProviderConfig(GROQ_OPENAI_COMPAT_BASE_URL, groq_key, GROQ_PRIMARY)
+    a3_fallback = ProviderConfig(GEMINI_OPENAI_COMPAT_BASE_URL, gemini_key, GEMINI_FLASH)
+    return a1, a2, a3_primary, a3_fallback
 
 
 def _zero_token_usage() -> dict:
@@ -74,12 +98,19 @@ async def _with_progress(coro, stage: str, detail: str, on_progress):
 
 async def run_review(
     owner: str, repo: str, pr_number: int, head_sha: str, github_token: str,
-    gemini_api_key: str, groq_api_key: str, root: Path, post: bool = True,
+    a1_config: ProviderConfig, a2_config: ProviderConfig,
+    a3_primary_config: ProviderConfig, a3_fallback_config: ProviderConfig,
+    root: Path, post: bool = True,
     on_progress: Callable[[str, str], None] | None = None,
 ) -> dict:
     """Returns the findings.json-shaped dict. Never raises for expected
     conditions (oversize PR, refusals, gate exhaustion) - those are all
     degradations logged in the returned dict, per "Degrade, never crash".
+
+    Provider-agnostic: each of the four ProviderConfig params is an
+    independent (base_url, api_key, model) triple - default_provider_
+    configs_from_env() builds the zero-config Gemini+Groq default from just
+    GEMINI_API_KEY/GROQ_API_KEY, but any OpenAI-compatible endpoint works.
 
     post=True is the library default (matches review.yml's existing
     production behavior unchanged). cli.py, the local ad-hoc wrapper that
@@ -133,14 +164,16 @@ async def run_review(
         semgrep_hits = run_semgrep(root, reviewable_files)
         progress("semgrep_done", f"{sum(len(v) for v in semgrep_hits.values())} hits")
 
-    gemini_client = genai.Client(api_key=gemini_api_key)
-    groq_client = AsyncGroq(api_key=groq_api_key)
+    a1_client = make_client(a1_config)
+    a2_client = make_client(a2_config)
+    a3_primary_client = make_client(a3_primary_config)
+    a3_fallback_client = make_client(a3_fallback_config)
 
     # --- A1: NUM_PASSES concurrent passes, each a differently-shuffled diff
     pass_diffs = [shuffle_hunks(diff_text, seed=i) for i in range(NUM_PASSES)]
     pass_results = await asyncio.gather(*[
         _with_progress(
-            run_pass(gemini_client, GEMINI_FLASH_LITE, GEMINI_FLASH_LITE_SEM, root, pass_diffs[i], f"p{i + 1}", changed_lines, deleted),
+            run_pass(a1_client, a1_config.model, A1_SEM, root, pass_diffs[i], f"p{i + 1}", changed_lines, deleted),
             "a1_pass_done", f"p{i + 1}", on_progress,
         )
         for i in range(NUM_PASSES)
@@ -170,7 +203,7 @@ async def run_review(
     # --- A2: cluster + vote
     threshold = int(os.environ.get("VOTE_THRESHOLD", DEFAULT_VOTE_THRESHOLD))
     clusters, used_deterministic_clustering, a2_usage = await run_aggregation(
-        gemini_client, GEMINI_FLASH, GEMINI_FLASH_SEM, findings_by_pass, threshold=threshold,
+        a2_client, a2_config.model, A2_SEM, findings_by_pass, threshold=threshold,
     )
     total_usage.input_tokens += a2_usage.input_tokens
     total_usage.output_tokens += a2_usage.output_tokens
@@ -181,14 +214,15 @@ async def run_review(
 
     # --- A3: adversarial validation, fanned out
     verdicts, a3_usage = await run_all_validators(
-        groq_client, gemini_client, GROQ_PRIMARY, GEMINI_FLASH, GROQ_SEM, GEMINI_FLASH_SEM, clusters,
+        a3_primary_client, a3_fallback_client, a3_primary_config.model, a3_fallback_config.model,
+        A3_PRIMARY_SEM, A3_FALLBACK_SEM, clusters,
     )
     total_usage.input_tokens += a3_usage.input_tokens
     total_usage.output_tokens += a3_usage.output_tokens
     a3_calls += len(clusters)
     progress("a3_done", f"{len(verdicts)} verdicts")
     for v in verdicts:
-        if v.validator_family != "llama":
+        if v.validator_family != a3_primary_config.model:
             degradations.append({"node": "a3", "cluster_id": v.cluster_id, "action": "same_family_fallback_used"})
         if v.refutation == "validator exhausted retries or was refused by both providers":
             degradations.append({"node": "a3", "cluster_id": v.cluster_id, "action": "marked_uncertain"})
@@ -223,7 +257,8 @@ async def run_review(
     return {
         "schema_version": SCHEMA_VERSION,
         "pr": pr_number,
-        "models": {"a1": GEMINI_FLASH_LITE, "a2": GEMINI_FLASH, "a3_primary": GROQ_PRIMARY, "a3_fallback": GEMINI_FLASH},
+        "models": {"a1": a1_config.model, "a2": a2_config.model,
+                   "a3_primary": a3_primary_config.model, "a3_fallback": a3_fallback_config.model},
         "model_resolution_date": MODEL_RESOLUTION_DATE,
         "vote_threshold": threshold,
         "passes_surviving": passes_surviving,
@@ -246,8 +281,11 @@ def main() -> int:
     pr_number = int(os.environ["PR_NUMBER"])
     head_sha = os.environ["HEAD_SHA"]  # workflow passes github.event.pull_request.head.sha
     github_token = os.environ["GITHUB_TOKEN"]
-    gemini_api_key = os.environ["GEMINI_API_KEY"]
-    groq_api_key = os.environ["GROQ_API_KEY"]
+    configs = default_provider_configs_from_env()
+    if configs is None:
+        print("Error: GEMINI_API_KEY and GROQ_API_KEY must both be set.")
+        return 1
+    a1_config, a2_config, a3_primary_config, a3_fallback_config = configs
     # PR_CHECKOUT_PATH, not GITHUB_WORKSPACE: the workflow checks out this
     # bugbot's own (trusted, base-branch) code at GITHUB_WORKSPACE and the
     # PR's (untrusted) content into a separate directory. root must point at
@@ -255,7 +293,10 @@ def main() -> int:
     # ever executed or installed. See review.yml.
     root = Path(os.environ["PR_CHECKOUT_PATH"])
 
-    result = asyncio.run(run_review(owner, repo, pr_number, head_sha, github_token, gemini_api_key, groq_api_key, root))
+    result = asyncio.run(run_review(
+        owner, repo, pr_number, head_sha, github_token,
+        a1_config, a2_config, a3_primary_config, a3_fallback_config, root,
+    ))
 
     output_path = Path("findings.json")
     output_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")

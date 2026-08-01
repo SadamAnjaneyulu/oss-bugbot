@@ -11,10 +11,8 @@ from __future__ import annotations
 
 import json
 
-from google.genai import types as gtypes
-
 from gates import NodeExhausted, check_g2, run_with_retries
-from llm import SAFETY_FINISH_REASONS, LLMResponse, SafetyRefusal, TokenUsage
+from llm import LLMResponse, SafetyRefusal, TokenUsage, call_llm
 from schemas import AggregatorOutput, Cluster, Finding, to_response_schema
 
 DEFAULT_VOTE_THRESHOLD = 2
@@ -45,36 +43,7 @@ async def _call_a2(client, model: str, semaphore, findings_by_pass: dict[str, li
     user_text = _findings_prompt(findings_by_pass)
     if feedback:
         user_text += f"\n\nYour previous attempt was rejected: {feedback}\nFix this and try again."
-
-    async with semaphore:
-        response = await client.aio.models.generate_content(
-            model=model,
-            contents=[gtypes.Content(role="user", parts=[gtypes.Part(text=user_text)])],
-            config=gtypes.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                response_json_schema=schema,
-            ),
-        )
-
-    candidates = response.candidates or []
-    if not candidates:
-        raise SafetyRefusal(f"gemini:{model} a2: no candidates")
-    finish_value = getattr(getattr(candidates[0], "finish_reason", None), "value", None)
-    if finish_value in SAFETY_FINISH_REASONS:
-        raise SafetyRefusal(f"gemini:{model} a2: finish_reason={finish_value}")
-    if not response.text:
-        raise SafetyRefusal(f"gemini:{model} a2: empty response")
-
-    usage = response.usage_metadata
-    output_tokens = getattr(usage, "candidates_token_count", None) or getattr(usage, "response_token_count", None) or 0
-    return LLMResponse(
-        text=response.text,
-        input_tokens=getattr(usage, "prompt_token_count", 0) or 0,
-        output_tokens=output_tokens,
-        model=model,
-        provider="gemini",
-    )
+    return await call_llm(client, model, SYSTEM_PROMPT, user_text, schema, "AggregatorOutput", semaphore)
 
 
 def _deterministic_cluster(findings_by_pass: dict[str, list[Finding]]) -> list[Cluster]:

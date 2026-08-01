@@ -9,9 +9,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import main  # noqa: E402
 from diff import FileMeta  # noqa: E402
-from llm import TokenUsage  # noqa: E402
+from llm import ProviderConfig, TokenUsage  # noqa: E402
 from passes import PassUsage  # noqa: E402
 from schemas import Cluster, Finding, ValidatorOutput  # noqa: E402
+
+# Fake (base_url, api_key, model) configs - run_pass/run_aggregation/
+# run_all_validators are always mocked out in these tests, so the client
+# make_client() builds from these is never actually used for network I/O.
+FAKE_A1 = ProviderConfig("http://fake/v1", "gk", "m-a1")
+FAKE_A2 = ProviderConfig("http://fake/v1", "gk", "m-a2")
+FAKE_A3_PRIMARY = ProviderConfig("http://fake/v1", "qk", "m-a3p")
+FAKE_A3_FALLBACK = ProviderConfig("http://fake/v1", "gk", "m-a3f")
 
 
 class TestComputeScore(unittest.TestCase):
@@ -39,6 +47,23 @@ class TestComputeScore(unittest.TestCase):
         self.assertGreater(small_unanimous, larger_split)
 
 
+class TestDefaultProviderConfigsFromEnv(unittest.TestCase):
+    def test_returns_none_if_either_key_missing(self):
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "g"}, clear=True):
+            self.assertIsNone(main.default_provider_configs_from_env())
+        with patch.dict("os.environ", {"GROQ_API_KEY": "q"}, clear=True):
+            self.assertIsNone(main.default_provider_configs_from_env())
+
+    def test_builds_four_configs_when_both_keys_present(self):
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "g", "GROQ_API_KEY": "q"}, clear=True):
+            a1, a2, a3_primary, a3_fallback = main.default_provider_configs_from_env()
+        self.assertEqual(a1.api_key, "g")
+        self.assertEqual(a3_primary.api_key, "q")
+        self.assertEqual(a3_fallback.api_key, "g")  # fallback is Gemini, not a second Groq call
+        self.assertIn("googleapis.com", a1.base_url)
+        self.assertIn("groq.com", a3_primary.base_url)
+
+
 class TestRunReviewOversizeGate(unittest.TestCase):
     def test_oversize_pr_skips_before_diff_fetch(self):
         big_files = [FileMeta(f"f{i}.py", "modified", 100, 0, 100) for i in range(10)]  # 1000 lines total
@@ -48,7 +73,9 @@ class TestRunReviewOversizeGate(unittest.TestCase):
 
         with patch("main.fetch_pr_files", side_effect=fake_fetch_pr_files), \
              patch("main.fetch_diff", new_callable=AsyncMock) as mock_fetch_diff:
-            result = asyncio.run(main.run_review("o", "r", 1, "sha", "tok", "gk", "qk", Path(".")))
+            result = asyncio.run(main.run_review(
+                "o", "r", 1, "sha", "tok", FAKE_A1, FAKE_A2, FAKE_A3_PRIMARY, FAKE_A3_FALLBACK, Path("."),
+            ))
 
         self.assertTrue(result["skipped"])
         self.assertIn("changed lines", result["skip_reason"])
@@ -73,7 +100,7 @@ class TestRunReviewHappyPath(unittest.TestCase):
         cluster = Cluster(cluster_id="c1", vote_count=4, supporting_pass_ids=["p1", "p2", "p3", "p4"], merged=finding)
         verdict = ValidatorOutput(
             cluster_id="c1", verdict="confirmed", refutation="none",
-            validator_family="llama", validator_confidence=0.9, comment_markdown="**Bug**: real",
+            validator_family="m-a3p", validator_confidence=0.9, comment_markdown="**Bug**: real",
         )
 
         async def fake_fetch_pr_files(*a, **kw):
@@ -107,9 +134,10 @@ class TestRunReviewHappyPath(unittest.TestCase):
              patch("main.run_aggregation", side_effect=fake_run_aggregation), \
              patch("main.run_all_validators", side_effect=fake_run_all_validators), \
              patch("main.fetch_existing_markers", side_effect=fake_fetch_existing_markers), \
-             patch("main.post_review", side_effect=fake_post_review), \
-             patch("main.genai.Client"), patch("main.AsyncGroq"):
-            result = asyncio.run(main.run_review("o", "r", 1, "sha", "tok", "gk", "qk", Path(tmp)))
+             patch("main.post_review", side_effect=fake_post_review):
+            result = asyncio.run(main.run_review(
+                "o", "r", 1, "sha", "tok", FAKE_A1, FAKE_A2, FAKE_A3_PRIMARY, FAKE_A3_FALLBACK, Path(tmp),
+            ))
 
         self.assertEqual(len(result["findings"]), 1)
         self.assertEqual(result["findings"][0]["verdict"], "confirmed")
@@ -127,6 +155,13 @@ class TestRunReviewHappyPath(unittest.TestCase):
         self.assertEqual(usage["output_tokens"], 4 * 20 + 15 + 12)
         self.assertEqual(usage["total_tokens"], usage["input_tokens"] + usage["output_tokens"])
         self.assertEqual(usage["calls"], {"a1": 4, "a2": 1, "a3": 1})
+
+        # Models reported are the actually-configured ones, not hardcoded
+        # Gemini/Groq constants - this is what makes the pipeline provider-
+        # agnostic in a way findings.json consumers can actually see.
+        self.assertEqual(result["models"], {
+            "a1": "m-a1", "a2": "m-a2", "a3_primary": "m-a3p", "a3_fallback": "m-a3f",
+        })
 
     def test_dry_run_never_calls_post_review_but_still_reports_findings(self):
         # cli.py's default (--post not passed) must never hit the write
@@ -146,7 +181,7 @@ class TestRunReviewHappyPath(unittest.TestCase):
         cluster = Cluster(cluster_id="c1", vote_count=4, supporting_pass_ids=["p1", "p2", "p3", "p4"], merged=finding)
         verdict = ValidatorOutput(
             cluster_id="c1", verdict="confirmed", refutation="none",
-            validator_family="llama", validator_confidence=0.9, comment_markdown="**Bug**: real",
+            validator_family="m-a3p", validator_confidence=0.9, comment_markdown="**Bug**: real",
         )
 
         async def fake_fetch_pr_files(*a, **kw):
@@ -175,9 +210,11 @@ class TestRunReviewHappyPath(unittest.TestCase):
              patch("main.run_aggregation", side_effect=fake_run_aggregation), \
              patch("main.run_all_validators", side_effect=fake_run_all_validators), \
              patch("main.fetch_existing_markers", side_effect=fake_fetch_existing_markers), \
-             patch("main.post_review") as mock_post_review, \
-             patch("main.genai.Client"), patch("main.AsyncGroq"):
-            result = asyncio.run(main.run_review("o", "r", 1, "sha", "tok", "gk", "qk", Path(tmp), post=False))
+             patch("main.post_review") as mock_post_review:
+            result = asyncio.run(main.run_review(
+                "o", "r", 1, "sha", "tok", FAKE_A1, FAKE_A2, FAKE_A3_PRIMARY, FAKE_A3_FALLBACK, Path(tmp),
+                post=False,
+            ))
 
         mock_post_review.assert_not_called()
         self.assertEqual(len(result["findings"]), 1)
@@ -197,7 +234,7 @@ class TestRunReviewHappyPath(unittest.TestCase):
         cluster = Cluster(cluster_id="c1", vote_count=1, supporting_pass_ids=["p1"], merged=finding)
         verdict = ValidatorOutput(
             cluster_id="c1", verdict="false_positive", refutation="not a real bug",
-            validator_family="llama", validator_confidence=0.9, comment_markdown="",
+            validator_family="m-a3p", validator_confidence=0.9, comment_markdown="",
         )
 
         async def fake_fetch_pr_files(*a, **kw):
@@ -230,9 +267,10 @@ class TestRunReviewHappyPath(unittest.TestCase):
              patch("main.run_aggregation", side_effect=fake_run_aggregation), \
              patch("main.run_all_validators", side_effect=fake_run_all_validators), \
              patch("main.fetch_existing_markers", side_effect=fake_fetch_existing_markers), \
-             patch("main.post_review", side_effect=fake_post_review), \
-             patch("main.genai.Client"), patch("main.AsyncGroq"):
-            result = asyncio.run(main.run_review("o", "r", 1, "sha", "tok", "gk", "qk", Path(tmp)))
+             patch("main.post_review", side_effect=fake_post_review):
+            result = asyncio.run(main.run_review(
+                "o", "r", 1, "sha", "tok", FAKE_A1, FAKE_A2, FAKE_A3_PRIMARY, FAKE_A3_FALLBACK, Path(tmp),
+            ))
 
         posted_comments = fake_post_review.called_with[-1]
         self.assertEqual(posted_comments, [])  # false_positive finding never becomes a comment
@@ -255,7 +293,7 @@ class TestRunReviewHappyPath(unittest.TestCase):
         cluster = Cluster(cluster_id="c1", vote_count=4, supporting_pass_ids=["p1", "p2", "p3", "p4"], merged=finding)
         verdict = ValidatorOutput(
             cluster_id="c1", verdict="confirmed", refutation="none",
-            validator_family="llama", validator_confidence=0.9, comment_markdown="**Bug**: real",
+            validator_family="m-a3p", validator_confidence=0.9, comment_markdown="**Bug**: real",
         )
 
         async def fake_fetch_pr_files(*a, **kw):
@@ -289,10 +327,9 @@ class TestRunReviewHappyPath(unittest.TestCase):
              patch("main.run_aggregation", side_effect=fake_run_aggregation), \
              patch("main.run_all_validators", side_effect=fake_run_all_validators), \
              patch("main.fetch_existing_markers", side_effect=fake_fetch_existing_markers), \
-             patch("main.post_review", side_effect=fake_post_review), \
-             patch("main.genai.Client"), patch("main.AsyncGroq"):
+             patch("main.post_review", side_effect=fake_post_review):
             asyncio.run(main.run_review(
-                "o", "r", 1, "sha", "tok", "gk", "qk", Path(tmp),
+                "o", "r", 1, "sha", "tok", FAKE_A1, FAKE_A2, FAKE_A3_PRIMARY, FAKE_A3_FALLBACK, Path(tmp),
                 on_progress=lambda stage, detail: events.append(stage),
             ))
 
@@ -309,7 +346,9 @@ class TestRunReviewHappyPath(unittest.TestCase):
             return big_files
 
         with patch("main.fetch_pr_files", side_effect=fake_fetch_pr_files):
-            result = asyncio.run(main.run_review("o", "r", 1, "sha", "tok", "gk", "qk", Path(".")))
+            result = asyncio.run(main.run_review(
+                "o", "r", 1, "sha", "tok", FAKE_A1, FAKE_A2, FAKE_A3_PRIMARY, FAKE_A3_FALLBACK, Path("."),
+            ))
 
         self.assertTrue(result["skipped"])
 

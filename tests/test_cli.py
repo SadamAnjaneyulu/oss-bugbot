@@ -197,7 +197,7 @@ class TestMainRoutesToInteractive(unittest.TestCase):
              patch("cli.run_interactive", return_value=0) as mock_interactive:
             code = cli.main()
         self.assertEqual(code, 0)
-        mock_interactive.assert_called_once_with("t", "g", "q")
+        mock_interactive.assert_called_once_with("t")
 
     def test_no_pr_flag_but_missing_env_never_reaches_interactive(self):
         with patch.object(sys, "argv", ["cli.py"]), \
@@ -212,13 +212,13 @@ class TestRunInteractive(unittest.TestCase):
     def test_exit_command_returns_immediately(self):
         with patch("cli.Prompt.ask", return_value="exit"), \
              patch("cli.run_one_review") as mock_review:
-            code = cli.run_interactive("t", "g", "q")
+            code = cli.run_interactive("t")
         self.assertEqual(code, 0)
         mock_review.assert_not_called()
 
     def test_ctrl_c_returns_cleanly(self):
         with patch("cli.Prompt.ask", side_effect=KeyboardInterrupt):
-            code = cli.run_interactive("t", "g", "q")
+            code = cli.run_interactive("t")
         self.assertEqual(code, 0)
 
     def test_empty_input_is_skipped_not_treated_as_url(self):
@@ -226,14 +226,14 @@ class TestRunInteractive(unittest.TestCase):
         # Second call: exit.
         with patch("cli.Prompt.ask", side_effect=["", "exit"]), \
              patch("cli.run_one_review") as mock_review:
-            code = cli.run_interactive("t", "g", "q")
+            code = cli.run_interactive("t")
         self.assertEqual(code, 0)
         mock_review.assert_not_called()
 
     def test_invalid_url_reports_error_and_continues_loop(self):
         with patch("cli.Prompt.ask", side_effect=["not-a-url", "exit"]), \
              patch("cli.run_one_review") as mock_review:
-            code = cli.run_interactive("t", "g", "q")
+            code = cli.run_interactive("t")
         self.assertEqual(code, 0)
         mock_review.assert_not_called()  # invalid URL never reaches the review call
 
@@ -242,16 +242,16 @@ class TestRunInteractive(unittest.TestCase):
         with patch("cli.Prompt.ask", side_effect=["https://github.com/o/r/pull/5", "exit"]), \
              patch("cli.Confirm.ask", return_value=False) as mock_confirm, \
              patch("cli.run_one_review", return_value=fake_result) as mock_review:
-            code = cli.run_interactive("t", "g", "q")
+            code = cli.run_interactive("t")
         self.assertEqual(code, 0)
-        mock_review.assert_called_once_with("o", "r", 5, "t", "g", "q", False)
+        mock_review.assert_called_once_with("o", "r", 5, "t", False)
         mock_confirm.assert_called_once()
 
     def test_review_error_none_result_does_not_crash_loop(self):
         with patch("cli.Prompt.ask", side_effect=["https://github.com/o/r/pull/5", "exit"]), \
              patch("cli.Confirm.ask", return_value=False), \
              patch("cli.run_one_review", return_value=None):
-            code = cli.run_interactive("t", "g", "q")
+            code = cli.run_interactive("t")
         self.assertEqual(code, 0)
 
 

@@ -3,7 +3,6 @@ unidiff
 pydantic>=2
 pyyaml
 semgrep
-google-genai
-groq
+openai
 rich
 textual

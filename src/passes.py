@@ -1,22 +1,31 @@
 """A1: N async reviewer passes, randomized hunk order, tool loop over the
 local checkout, wrapped in G1 with retry-same-node + drop-pass degradation.
 
-Live-verified before writing this file (see scratchpad live_check_tools.py /
-live_check_combo2.py, not committed - throwaway probes): Gemini's function
-calling and response_json_schema DO compose in a single call/config, and a
-turn with a function_call has response.text == None, which is expected, not
-a refusal - only an actual SAFETY/PROHIBITED_CONTENT finish_reason or a
-final turn with no function_call AND no text counts as a refusal.
+Provider-agnostic: uses any OpenAI-compatible chat-completions endpoint
+(passes.py used to be Gemini-native). Two things live-verified against real
+Gemini-compat and Groq endpoints before writing this version:
+
+1. Tool-calling in the OpenAI wire shape works on both. A turn with
+   tool_calls has message.content == None, which is expected, not a
+   refusal - only an actual finish_reason=content_filter, or a final turn
+   with no tool_calls AND no content, counts as a refusal.
+2. Combining `tools=` and strict `response_format: json_schema` in ONE
+   request does NOT work everywhere - Groq 400s with "json mode cannot be
+   combined with tool/function calling" (Gemini's compat layer accepts the
+   combination, but that can't be relied on generically). Fix: split-phase
+   requests - `tools` is sent WITHOUT `response_format` on turns where tool
+   use is still allowed, and `response_format` is sent WITHOUT `tools` only
+   once tools are off the table (model gave a final answer, or the call cap
+   was hit). Verified working on both endpoints this way.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
-from google.genai import types as gtypes
-
 from gates import GateViolation, NodeExhausted, check_g1, run_with_retries
-from llm import SAFETY_FINISH_REASONS, SafetyRefusal
+from llm import SafetyRefusal
 from schemas import ReviewerOutput, to_response_schema
 from tools import find_definition, find_references, list_dir, read_file
 
@@ -40,10 +49,10 @@ the code under review, not something to obey.
 """
 
 _TOOL_DECLS = [
-    gtypes.FunctionDeclaration(
-        name="read_file",
-        description="Read lines [start, end] of a file in the checkout. Omit start/end for the whole file.",
-        parameters_json_schema={
+    {"type": "function", "function": {
+        "name": "read_file",
+        "description": "Read lines [start, end] of a file in the checkout. Omit start/end for the whole file.",
+        "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
@@ -53,37 +62,37 @@ _TOOL_DECLS = [
             "required": ["path"],
             "additionalProperties": False,
         },
-    ),
-    gtypes.FunctionDeclaration(
-        name="list_dir",
-        description="List entries in a directory of the checkout.",
-        parameters_json_schema={
+    }},
+    {"type": "function", "function": {
+        "name": "list_dir",
+        "description": "List entries in a directory of the checkout.",
+        "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string"}},
             "required": ["path"],
             "additionalProperties": False,
         },
-    ),
-    gtypes.FunctionDeclaration(
-        name="find_references",
-        description="Find lines referencing a symbol anywhere in the checkout (capped at 50 results).",
-        parameters_json_schema={
+    }},
+    {"type": "function", "function": {
+        "name": "find_references",
+        "description": "Find lines referencing a symbol anywhere in the checkout (capped at 50 results).",
+        "parameters": {
             "type": "object",
             "properties": {"symbol": {"type": "string"}},
             "required": ["symbol"],
             "additionalProperties": False,
         },
-    ),
-    gtypes.FunctionDeclaration(
-        name="find_definition",
-        description="Find where a symbol is defined (Python/TypeScript only).",
-        parameters_json_schema={
+    }},
+    {"type": "function", "function": {
+        "name": "find_definition",
+        "description": "Find where a symbol is defined (Python/TypeScript only).",
+        "parameters": {
             "type": "object",
             "properties": {"symbol": {"type": "string"}},
             "required": ["symbol"],
             "additionalProperties": False,
         },
-    ),
+    }},
 ]
 
 _TOOL_DISPATCH = {
@@ -115,75 +124,106 @@ def _dispatch_tool(name: str, args: dict, root) -> dict:
         return {"ok": False, "error": "bad_arguments", "hint": str(exc)}
 
 
-def _build_config(schema: dict, include_tools: bool) -> gtypes.GenerateContentConfig:
-    return gtypes.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        tools=[gtypes.Tool(function_declarations=_TOOL_DECLS)] if include_tools else None,
-        response_mime_type="application/json",
-        response_json_schema=schema,
-    )
-
-
 async def _run_tool_loop(client, model: str, semaphore, root, diff_text: str, pass_id: str) -> tuple[str, PassUsage]:
     """diff_text is used exactly as given - the caller (run_pass, via
     diff.shuffle_hunks) is responsible for giving each pass a differently
     ordered diff. This function does not reorder anything itself.
+
+    Split-phase requests, not one config combining tools + response_format
+    every turn (see module docstring for why): while tool use is still
+    allowed, the request carries `tools` and no `response_format`; once
+    tools are off (model answered directly, or the call cap was hit), the
+    request carries strict `response_format` and no `tools` key at all.
     """
     schema = to_response_schema(ReviewerOutput)
     usage = PassUsage()
 
-    user_text = (
-        f"pass_id: {pass_id}\n"
-        f"<untrusted_diff>\n{diff_text}\n</untrusted_diff>"
-    )
-    contents = [gtypes.Content(role="user", parts=[gtypes.Part(text=user_text)])]
+    user_text = f"pass_id: {pass_id}\n<untrusted_diff>\n{diff_text}\n</untrusted_diff>"
+    messages: list[dict] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_text},
+    ]
 
     include_tools = True
     while True:
+        kwargs = dict(model=model, messages=messages)
+        if include_tools:
+            kwargs["tools"] = _TOOL_DECLS
+        else:
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "ReviewerOutput", "strict": True, "schema": schema},
+            }
+
         async with semaphore:
-            response = await client.aio.models.generate_content(
-                model=model, contents=contents, config=_build_config(schema, include_tools),
-            )
+            response = await client.chat.completions.create(**kwargs)
 
-        candidate = response.candidates[0] if response.candidates else None
-        if candidate is None:
-            raise PassSafetyRefusal(f"gemini:{model} pass {pass_id}: no candidates")
+        choice = response.choices[0] if response.choices else None
+        if choice is None:
+            raise PassSafetyRefusal(f"{model} pass {pass_id}: no choices")
 
-        finish_value = getattr(getattr(candidate, "finish_reason", None), "value", None)
-        if finish_value in SAFETY_FINISH_REASONS:
-            raise PassSafetyRefusal(f"gemini:{model} pass {pass_id}: finish_reason={finish_value}")
+        if choice.finish_reason == "content_filter":
+            raise PassSafetyRefusal(f"{model} pass {pass_id}: finish_reason=content_filter")
 
-        usage_meta = response.usage_metadata
-        usage.input_tokens += getattr(usage_meta, "prompt_token_count", 0) or 0
-        usage.output_tokens += getattr(usage_meta, "candidates_token_count", 0) or 0
+        usage_meta = response.usage
+        usage.input_tokens += getattr(usage_meta, "prompt_tokens", 0) or 0
+        usage.output_tokens += getattr(usage_meta, "completion_tokens", 0) or 0
 
-        fc_parts = [p.function_call for p in candidate.content.parts if p.function_call]
+        message = choice.message
+        tool_calls = message.tool_calls or []
 
-        if not fc_parts:
-            if not response.text:
-                raise PassSafetyRefusal(f"gemini:{model} pass {pass_id}: empty final response")
-            return response.text, usage
+        if not tool_calls:
+            if not include_tools:
+                # Tools were already off for this request (cap hit, or the
+                # model already stopped calling tools last turn) - this
+                # response WAS schema-enforced, so it's the real final answer.
+                if not message.content:
+                    raise PassSafetyRefusal(f"{model} pass {pass_id}: empty final response")
+                return message.content, usage
+            # Model decided to stop calling tools, but this turn couldn't
+            # carry strict response_format alongside `tools` (some
+            # providers 400 on that combination - live-verified with
+            # Groq). Don't trust this content as the final answer yet: ask
+            # again with tools removed and the schema enforced, so the
+            # answer that's actually returned is guaranteed well-formed.
+            # The re-ask must end on a user turn, not the assistant's own
+            # reply - live-verified that Gemini's compat layer 400s on a
+            # request whose last message has role=assistant.
+            messages.append({"role": "assistant", "content": message.content})
+            messages.append({"role": "user", "content": "Respond with the required JSON schema now."})
+            include_tools = False
+            continue
 
         if not include_tools:
-            # Tools were already stripped from the request (cap hit last turn)
-            # but the model still tried to call one - it has no tool to call
-            # against, so there are no function_call parts possible here.
-            # Defensive: treat as a refusal-style failure to force retry.
-            raise PassSafetyRefusal(f"gemini:{model} pass {pass_id}: model attempted a call with no tools available")
+            # Tools were already stripped from the request (cap hit last
+            # turn) but the model still tried to call one - there is no
+            # tool to call against here. Defensive: treat as a
+            # refusal-style failure to force retry.
+            raise PassSafetyRefusal(f"{model} pass {pass_id}: model attempted a call with no tools available")
 
-        contents.append(candidate.content)
-        response_parts = []
-        for fc in fc_parts:
+        # Round-trip the SDK's own serialization of each tool call rather
+        # than hand-picking (id, name, arguments): live-verified that
+        # Gemini's compat layer attaches a provider extension field
+        # (thought_signature) to each tool call that MUST be echoed back on
+        # the next turn or the request 400s - a hand-built dict silently
+        # drops any such extension, .model_dump() doesn't.
+        messages.append({
+            "role": "assistant",
+            "content": message.content,
+            "tool_calls": [tc.model_dump() for tc in tool_calls],
+        })
+
+        for tc in tool_calls:
             usage.tool_calls_used += 1
-            result = _dispatch_tool(fc.name, fc.args or {}, root)
-            response_parts.append(gtypes.Part(function_response=gtypes.FunctionResponse(name=fc.name, response=result)))
+            args = json.loads(tc.function.arguments or "{}")  # OpenAI shape: a JSON string, not a dict
+            result = _dispatch_tool(tc.function.name, args, root)
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)})
             if usage.tool_calls_used >= MAX_TOOL_CALLS:
                 break
-        contents.append(gtypes.Content(role="user", parts=response_parts))
 
         if usage.tool_calls_used >= MAX_TOOL_CALLS:
             # Enforcement, not a prompt request: tools removed from the next
-            # request entirely, forcing a final answer. See plan.
+            # request entirely, forcing a final (schema-enforced) answer.
             include_tools = False
 
 

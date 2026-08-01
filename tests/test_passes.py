@@ -23,25 +23,35 @@ VALID_FINDING_JSON = json.dumps({
 })
 
 
-def tool_call_response(name, args, finish_reason="STOP"):
-    part = SimpleNamespace(function_call=SimpleNamespace(name=name, args=args), text=None)
-    content = SimpleNamespace(parts=[part])
-    candidate = SimpleNamespace(content=content, finish_reason=SimpleNamespace(value=finish_reason))
-    usage = SimpleNamespace(prompt_token_count=10, candidates_token_count=5)
-    return SimpleNamespace(candidates=[candidate], text=None, usage_metadata=usage)
+def tool_call_response(name, args, finish_reason="tool_calls"):
+    """OpenAI wire shape: tool_calls[].function.arguments is a JSON STRING
+    (not a dict, unlike Gemini's native fc.args) - passes.py's loop
+    json.loads's it before dispatch, so the fixture must produce a string
+    here too or it wouldn't be testing the real shape. tc needs a real
+    .model_dump() too - live-verified that passes.py round-trips the SDK's
+    own serialization of each tool call (not a hand-picked subset) because
+    Gemini's compat layer attaches a provider extension field that must be
+    echoed back on the next turn or the request 400s.
+    """
+    tc = SimpleNamespace(id="call_1", function=SimpleNamespace(name=name, arguments=json.dumps(args)))
+    tc.model_dump = lambda: {"id": tc.id, "type": "function",
+                              "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+    message = SimpleNamespace(content=None, tool_calls=[tc])
+    choice = SimpleNamespace(message=message, finish_reason=finish_reason)
+    usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
+    return SimpleNamespace(choices=[choice], usage=usage)
 
 
-def final_response(text, finish_reason="STOP"):
-    part = SimpleNamespace(function_call=None, text=text)
-    content = SimpleNamespace(parts=[part])
-    candidate = SimpleNamespace(content=content, finish_reason=SimpleNamespace(value=finish_reason))
-    usage = SimpleNamespace(prompt_token_count=10, candidates_token_count=20)
-    return SimpleNamespace(candidates=[candidate], text=text, usage_metadata=usage)
+def final_response(text, finish_reason="stop"):
+    message = SimpleNamespace(content=text, tool_calls=None)
+    choice = SimpleNamespace(message=message, finish_reason=finish_reason)
+    usage = SimpleNamespace(prompt_tokens=10, completion_tokens=20)
+    return SimpleNamespace(choices=[choice], usage=usage)
 
 
 def make_client(responses):
     client = MagicMock()
-    client.aio.models.generate_content = AsyncMock(side_effect=responses)
+    client.chat.completions.create = AsyncMock(side_effect=responses)
     return client
 
 
@@ -82,21 +92,27 @@ class TestRunPass(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_direct_final_answer_no_tools(self):
-        client = make_client([final_response(VALID_FINDING_JSON)])
+        # Even a "no tool calls at all" pass costs 2 requests under the
+        # split-phase design: the first turn (tools still offered) isn't
+        # schema-enforced, so its content is provisional - a second,
+        # tools-stripped + schema-enforced request gets the real answer.
+        client = make_client([final_response(VALID_FINDING_JSON), final_response(VALID_FINDING_JSON)])
         result, usage = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
         self.assertIsInstance(result, ReviewerOutput)
         self.assertEqual(len(result.findings), 1)
-        self.assertEqual(usage.input_tokens, 10)
-        self.assertEqual(usage.output_tokens, 20)
+        self.assertEqual(client.chat.completions.create.await_count, 2)
+        self.assertEqual(usage.input_tokens, 20)
+        self.assertEqual(usage.output_tokens, 40)
 
     def test_one_tool_call_then_final_answer(self):
         client = make_client([
             tool_call_response("read_file", {"path": "app.py"}),
-            final_response(VALID_FINDING_JSON),
+            final_response(VALID_FINDING_JSON),  # model stops calling tools, but not yet schema-enforced
+            final_response(VALID_FINDING_JSON),  # re-ask, schema-enforced - the real final answer
         ])
         result, usage = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
         self.assertIsInstance(result, ReviewerOutput)
-        self.assertEqual(client.aio.models.generate_content.await_count, 2)
+        self.assertEqual(client.chat.completions.create.await_count, 3)
 
     def test_tool_cap_forces_final_answer(self):
         # MAX_TOOL_CALLS tool-call turns, then the loop must strip tools and
@@ -107,21 +123,47 @@ class TestRunPass(unittest.TestCase):
         result, usage = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
         self.assertIsInstance(result, ReviewerOutput)
         # MAX_TOOL_CALLS tool turns + 1 forced-final turn
-        self.assertEqual(client.aio.models.generate_content.await_count, MAX_TOOL_CALLS + 1)
+        self.assertEqual(client.chat.completions.create.await_count, MAX_TOOL_CALLS + 1)
         self.assertEqual(usage.tool_calls_used, MAX_TOOL_CALLS)
 
+    def test_never_combines_tools_and_response_format_in_one_request(self):
+        # Real bug this guards against, caught by this exact test during
+        # development: Groq 400s if `tools` and strict `response_format`
+        # are combined in one request (live-verified). No single request
+        # may carry both keys; the last request (the schema-enforced
+        # final answer) must carry response_format and never tools.
+        client = make_client([
+            tool_call_response("read_file", {"path": "app.py"}),
+            final_response(VALID_FINDING_JSON),  # model stops calling tools, not yet schema-enforced
+            final_response(VALID_FINDING_JSON),  # re-ask, schema-enforced
+        ])
+        asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
+        for call in client.chat.completions.create.await_args_list:
+            kwargs = call.kwargs
+            self.assertFalse(
+                "tools" in kwargs and "response_format" in kwargs,
+                f"a single request combined tools and response_format: {kwargs}",
+            )
+        last_kwargs = client.chat.completions.create.await_args_list[-1].kwargs
+        self.assertIn("response_format", last_kwargs)
+        self.assertNotIn("tools", last_kwargs)
+
     def test_safety_refusal_returns_none_not_exception(self):
-        client = make_client([final_response(None, finish_reason="SAFETY")])
+        client = make_client([final_response(None, finish_reason="content_filter")])
         result, usage = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
         self.assertIsNone(result)
 
     def test_empty_candidates_returns_none(self):
-        response = SimpleNamespace(candidates=[], text=None, usage_metadata=None)
+        response = SimpleNamespace(choices=[], usage=None)
         client = make_client([response])
         result, usage = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
         self.assertIsNone(result)
 
     def test_g1_failure_retries_and_recovers(self):
+        # Every G1-retry attempt is itself a fresh _run_tool_loop call, and
+        # under the split-phase design each attempt costs 2 requests
+        # (unenforced direct answer, then the schema-enforced re-ask) even
+        # with zero tool calls - so 2 G1 attempts here means 4 total requests.
         bad_json = json.dumps({
             "pass_id": "p1",
             "findings": [{
@@ -130,14 +172,17 @@ class TestRunPass(unittest.TestCase):
                 "semgrep_corroborated": False, "self_confidence": 0.5,
             }],
         })
-        client = make_client([final_response(bad_json), final_response(VALID_FINDING_JSON)])
+        client = make_client([
+            final_response(bad_json), final_response(bad_json),          # attempt 1: fails G1
+            final_response(VALID_FINDING_JSON), final_response(VALID_FINDING_JSON),  # attempt 2: succeeds
+        ])
         result, usage = asyncio.run(run_pass(client, "m", self.sem, self.root, "diff", "p1", self.changed_lines, self.deleted))
         self.assertIsInstance(result, ReviewerOutput)
-        self.assertEqual(client.aio.models.generate_content.await_count, 2)
-        # Usage sums BOTH attempts, not just the one that finally validated -
-        # the rejected first attempt spent real tokens too.
-        self.assertEqual(usage.input_tokens, 20)
-        self.assertEqual(usage.output_tokens, 40)
+        self.assertEqual(client.chat.completions.create.await_count, 4)
+        # Usage sums every request across both attempts, not just the one
+        # that finally validated - every rejected attempt spent real tokens.
+        self.assertEqual(usage.input_tokens, 40)
+        self.assertEqual(usage.output_tokens, 80)
 
     def test_g1_failure_exhausted_returns_none(self):
         bad_json = json.dumps({

@@ -9,30 +9,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from llm import (  # noqa: E402
     LLMResponse,
+    ProviderConfig,
     ProviderError,
     SafetyRefusal,
-    call_gemini,
-    call_groq,
+    call_llm,
     call_with_provider_fallback,
+    make_client,
     parse_json_response,
 )
 
 
-def fake_gemini_client(text, finish_reason="STOP", prompt_tokens=100, response_tokens=50, candidates_present=True):
-    client = MagicMock()
-    if not candidates_present:
-        response = SimpleNamespace(candidates=[], text=None, usage_metadata=None)
-    else:
-        candidate = SimpleNamespace(finish_reason=SimpleNamespace(value=finish_reason))
-        # candidates_token_count is the field the real API actually populates
-        # (response_token_count exists in the stub but is empirically unused).
-        usage = SimpleNamespace(prompt_token_count=prompt_tokens, candidates_token_count=response_tokens)
-        response = SimpleNamespace(candidates=[candidate], text=text, usage_metadata=usage)
-    client.aio.models.generate_content = AsyncMock(return_value=response)
-    return client
-
-
-def fake_groq_client(content, finish_reason="stop", prompt_tokens=80, completion_tokens=40):
+def fake_openai_client(content, finish_reason="stop", prompt_tokens=80, completion_tokens=40):
     client = MagicMock()
     message = SimpleNamespace(content=content)
     choice = SimpleNamespace(message=message, finish_reason=finish_reason)
@@ -42,54 +29,35 @@ def fake_groq_client(content, finish_reason="stop", prompt_tokens=80, completion
     return client
 
 
-class TestCallGemini(unittest.TestCase):
+class TestMakeClient(unittest.TestCase):
+    def test_builds_client_with_base_url_and_key(self):
+        config = ProviderConfig(base_url="https://example.com/v1", api_key="sk-test", model="m")
+        client = make_client(config)
+        self.assertEqual(str(client.base_url), "https://example.com/v1/")
+        self.assertEqual(client.api_key, "sk-test")
+
+
+class TestCallLlm(unittest.TestCase):
     def test_success(self):
-        client = fake_gemini_client('{"pass_id": "p1", "findings": []}')
+        client = fake_openai_client('{"cluster_id": "c1"}')
         sem = asyncio.Semaphore(1)
-        result = asyncio.run(call_gemini(client, "gemini-3.5-flash-lite", "sys", "user", {}, sem))
+        result = asyncio.run(call_llm(client, "openai/gpt-oss-120b", "sys", "user", {}, "schema_name", sem))
         self.assertIsInstance(result, LLMResponse)
-        self.assertEqual(result.provider, "gemini")
-        self.assertEqual(result.input_tokens, 100)
-        self.assertEqual(result.output_tokens, 50)
-
-    def test_safety_finish_reason_raises(self):
-        client = fake_gemini_client("blocked", finish_reason="SAFETY")
-        sem = asyncio.Semaphore(1)
-        with self.assertRaises(SafetyRefusal):
-            asyncio.run(call_gemini(client, "gemini-3.5-flash-lite", "sys", "user", {}, sem))
-
-    def test_prohibited_content_raises(self):
-        client = fake_gemini_client("blocked", finish_reason="PROHIBITED_CONTENT")
-        sem = asyncio.Semaphore(1)
-        with self.assertRaises(SafetyRefusal):
-            asyncio.run(call_gemini(client, "gemini-3.5-flash-lite", "sys", "user", {}, sem))
-
-    def test_empty_candidates_raises(self):
-        client = fake_gemini_client(None, candidates_present=False)
-        sem = asyncio.Semaphore(1)
-        with self.assertRaises(SafetyRefusal):
-            asyncio.run(call_gemini(client, "gemini-3.5-flash-lite", "sys", "user", {}, sem))
-
-
-class TestCallGroq(unittest.TestCase):
-    def test_success(self):
-        client = fake_groq_client('{"cluster_id": "c1"}')
-        sem = asyncio.Semaphore(1)
-        result = asyncio.run(call_groq(client, "openai/gpt-oss-120b", "sys", "user", {}, "schema_name", sem))
-        self.assertEqual(result.provider, "groq")
+        self.assertEqual(result.provider, "openai-compatible")
         self.assertEqual(result.input_tokens, 80)
+        self.assertEqual(result.output_tokens, 40)
 
     def test_content_filter_raises(self):
-        client = fake_groq_client(None, finish_reason="content_filter")
+        client = fake_openai_client(None, finish_reason="content_filter")
         sem = asyncio.Semaphore(1)
         with self.assertRaises(SafetyRefusal):
-            asyncio.run(call_groq(client, "openai/gpt-oss-120b", "sys", "user", {}, "schema_name", sem))
+            asyncio.run(call_llm(client, "openai/gpt-oss-120b", "sys", "user", {}, "schema_name", sem))
 
     def test_empty_content_raises(self):
-        client = fake_groq_client("")
+        client = fake_openai_client("")
         sem = asyncio.Semaphore(1)
         with self.assertRaises(SafetyRefusal):
-            asyncio.run(call_groq(client, "openai/gpt-oss-120b", "sys", "user", {}, "schema_name", sem))
+            asyncio.run(call_llm(client, "openai/gpt-oss-120b", "sys", "user", {}, "schema_name", sem))
 
 
 class TestProviderFallback(unittest.TestCase):
@@ -97,11 +65,11 @@ class TestProviderFallback(unittest.TestCase):
         fallback_called = {"n": 0}
 
         async def primary():
-            return LLMResponse("ok", 1, 1, "m", "gemini")
+            return LLMResponse("ok", 1, 1, "m", "openai-compatible")
 
         async def fallback():
             fallback_called["n"] += 1
-            return LLMResponse("fallback", 1, 1, "m", "groq")
+            return LLMResponse("fallback", 1, 1, "m", "openai-compatible")
 
         result = asyncio.run(call_with_provider_fallback(primary, fallback))
         self.assertEqual(result.text, "ok")
@@ -112,7 +80,7 @@ class TestProviderFallback(unittest.TestCase):
             raise SafetyRefusal("blocked")
 
         async def fallback():
-            return LLMResponse("fallback worked", 1, 1, "m", "groq")
+            return LLMResponse("fallback worked", 1, 1, "m", "openai-compatible")
 
         result = asyncio.run(call_with_provider_fallback(primary, fallback))
         self.assertEqual(result.text, "fallback worked")
@@ -125,7 +93,7 @@ class TestProviderFallback(unittest.TestCase):
 
         async def fallback():
             fallback_called["n"] += 1
-            return LLMResponse("should not run", 1, 1, "m", "groq")
+            return LLMResponse("should not run", 1, 1, "m", "openai-compatible")
 
         with self.assertRaises(ProviderError):
             asyncio.run(call_with_provider_fallback(primary, fallback))
@@ -151,19 +119,18 @@ class TestSemaphoreActuallyLimits(unittest.TestCase):
             await asyncio.sleep(0.01)
             max_concurrent["n"] -= 1
             return SimpleNamespace(
-                candidates=[SimpleNamespace(finish_reason=SimpleNamespace(value="STOP"))],
-                text="{}",
-                usage_metadata=SimpleNamespace(prompt_token_count=1, candidates_token_count=1),
+                choices=[SimpleNamespace(message=SimpleNamespace(content="{}"), finish_reason="stop")],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
             )
 
         client = MagicMock()
-        client.aio.models.generate_content = slow_call
+        client.chat.completions.create = slow_call
         sem = asyncio.Semaphore(1)
 
         async def run_both():
             await asyncio.gather(
-                call_gemini(client, "m", "sys", "u1", {}, sem),
-                call_gemini(client, "m", "sys", "u2", {}, sem),
+                call_llm(client, "m", "sys", "u1", {}, "schema_name", sem),
+                call_llm(client, "m", "sys", "u2", {}, "schema_name", sem),
             )
 
         asyncio.run(run_both())

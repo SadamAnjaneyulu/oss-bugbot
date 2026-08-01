@@ -9,3 +9,7 @@ venv/
 findings.json
 .eval_repos/
 *.patch
+node_modules/
+web/frontend/dist/
+web/frontend/.env
+web/frontend/.env.local

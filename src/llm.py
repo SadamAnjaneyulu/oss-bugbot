@@ -1,23 +1,25 @@
-"""Provider abstraction: Gemini (google-genai) + Groq, async, structured JSON
-output, safety-refusal handling, per-provider concurrency caps.
+"""Provider abstraction: any OpenAI-compatible endpoint (base_url + api_key +
+model), async, structured JSON output, safety-refusal handling.
 
-Model IDs and rate limits below are pinned and dated - see MODELS and
-"Reproducibility" note. Verify both against the provider's live dashboard
-before trusting old numbers; neither provider publishes a permanently fixed
-free-tier table (Google's rate-limits page is now dynamic per AI Studio
-account; Groq's model catalog changes with deprecations).
+Was Gemini-native (google-genai) + Groq-native (groq SDK) until the pipeline
+went provider-agnostic - call_groq's shape was already the OpenAI wire
+format (Groq's SDK is a compatible fork of openai's), so this module is a
+generalization of that existing, already-tested shape, not new logic.
+Gemini is reached through its own documented OpenAI-compat layer
+(generativelanguage.googleapis.com/v1beta/openai/), live-verified to
+support both tool-calling and strict json_schema mode.
+
+Model IDs below are pinned and dated - see MODEL_RESOLUTION_DATE. Verify
+against the provider's live dashboard before trusting old numbers; neither
+Gemini nor Groq publishes a permanently fixed free-tier table.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 from dataclasses import dataclass
-from datetime import date
 
-from google import genai
-from google.genai import types as gtypes
-from groq import AsyncGroq
+from openai import AsyncOpenAI
 
 # --- Pinned models -----------------------------------------------------
 # Resolved 2026-08-01 against primary docs (ai.google.dev/gemini-api/docs/models,
@@ -28,28 +30,53 @@ from groq import AsyncGroq
 # by resolution date.
 MODEL_RESOLUTION_DATE = "2026-08-01"
 
-GEMINI_FLASH_LITE = "gemini-3.5-flash-lite"  # A1 reviewer
-GEMINI_FLASH = "gemini-3.5-flash"            # A2 aggregator, A3 fallback
-GROQ_PRIMARY = "openai/gpt-oss-120b"         # A3 validator - genuinely different
+GEMINI_FLASH_LITE = "gemini-3.5-flash-lite"  # default A1 reviewer
+GEMINI_FLASH = "gemini-3.5-flash"            # default A2 aggregator, A3 fallback
+GROQ_PRIMARY = "openai/gpt-oss-120b"         # default A3 validator - genuinely different
                                               # family from Gemini (OpenAI-arch
                                               # open-weight, not Google), confirmed
                                               # free-tier via console.groq.com/docs/rate-limits
 
+# OpenAI-compat base URLs for the two providers this project defaults to -
+# used by main.py's default_provider_configs_from_env() so review.yml keeps
+# working unchanged. Any other OpenAI-compatible provider (OpenAI, Together,
+# Fireworks, DeepSeek, OpenRouter, local Ollama, ...) just needs its own
+# base_url - nothing here is Gemini/Groq-specific beyond these two defaults.
+GEMINI_OPENAI_COMPAT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+GROQ_OPENAI_COMPAT_BASE_URL = "https://api.groq.com/openai/v1"
+
 MODELS = {"a1": GEMINI_FLASH_LITE, "a2": GEMINI_FLASH, "a3_primary": GROQ_PRIMARY, "a3_fallback": GEMINI_FLASH}
 
+
+@dataclass(frozen=True)
+class ProviderConfig:
+    """base_url + api_key + model - the whole "any OpenAI-compatible
+    provider" contract. Four independent instances thread through the
+    pipeline (a1, a2, a3_primary, a3_fallback) rather than one shared
+    config, since A3 being a genuinely different provider/model family from
+    A1/A2 is a deliberate adversarial-independence design choice, not an
+    accident of how Gemini+Groq happened to get picked originally.
+    """
+    base_url: str
+    api_key: str
+    model: str
+
+
+def make_client(config: ProviderConfig) -> AsyncOpenAI:
+    return AsyncOpenAI(base_url=config.base_url, api_key=config.api_key)
+
+
 # --- Concurrency caps ----------------------------------------------------
-# Soft pre-emptive limits based on last-verified free-tier figures. Treated
-# as a starting point, not gospel: Gemini's rate-limits page no longer
-# publishes a static table (dynamic per account in AI Studio), so 429s are
-# the authoritative signal - these semaphores exist to avoid hammering the
-# API into 429s constantly, not to guarantee we never see one.
+# Soft pre-emptive limits for the two DEFAULT providers (default_provider_
+# configs_from_env in main.py) - not gospel, 429s are the authoritative
+# signal. A visitor-supplied arbitrary provider has no known rate limit up
+# front, so main.py picks a conservative generic default for those instead
+# of looking it up here.
 RATE_LIMITS = {
     "gemini_flash_lite_rpm": 15,
     "gemini_flash_rpm": 10,
     "groq_gpt_oss_120b_rpm": 30,
 }
-
-SAFETY_FINISH_REASONS = {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "RECITATION"}
 
 
 class SafetyRefusal(Exception):
@@ -88,63 +115,21 @@ class TokenUsage:
         self.output_tokens += response.output_tokens
 
 
-async def call_gemini(
-    client: genai.Client,
-    model: str,
-    system_prompt: str,
-    user_content: str,
-    response_schema: dict,
-    semaphore: asyncio.Semaphore,
-) -> LLMResponse:
-    async with semaphore:
-        response = await client.aio.models.generate_content(
-            model=model,
-            contents=user_content,
-            config=gtypes.GenerateContentConfig(
-                system_instruction=system_prompt,
-                response_mime_type="application/json",
-                response_json_schema=response_schema,
-            ),
-        )
-
-    candidates = response.candidates or []
-    if not candidates:
-        raise SafetyRefusal(f"gemini:{model} returned no candidates (blocked)")
-
-    finish_reason = getattr(candidates[0], "finish_reason", None)
-    finish_value = getattr(finish_reason, "value", finish_reason)
-    if finish_value in SAFETY_FINISH_REASONS:
-        raise SafetyRefusal(f"gemini:{model} finish_reason={finish_value}")
-
-    text = response.text
-    if text is None:
-        raise SafetyRefusal(f"gemini:{model} returned empty text (likely blocked)")
-
-    usage = response.usage_metadata
-    # candidates_token_count is what the live API actually populates.
-    # response_token_count exists in the type stub's field list but was
-    # empirically None on real responses - caught by a live call, not by
-    # inspecting model_fields, which lists both without saying which one
-    # the server actually fills in.
-    output_tokens = getattr(usage, "candidates_token_count", None) or getattr(usage, "response_token_count", None) or 0
-    return LLMResponse(
-        text=text,
-        input_tokens=getattr(usage, "prompt_token_count", 0) or 0,
-        output_tokens=output_tokens,
-        model=model,
-        provider="gemini",
-    )
-
-
-async def call_groq(
-    client: AsyncGroq,
+async def call_llm(
+    client: AsyncOpenAI,
     model: str,
     system_prompt: str,
     user_content: str,
     response_schema: dict,
     schema_name: str,
-    semaphore: asyncio.Semaphore,
+    semaphore,
 ) -> LLMResponse:
+    """Generic call for any OpenAI-compatible provider - a generalization of
+    call_groq's body (already the OpenAI wire shape) to an arbitrary
+    base_url'd client instead of a Groq-specific one. No tool-calling here;
+    passes.py's A1 loop has its own request-building (tools and strict
+    response_format can't always be combined in one call - see passes.py).
+    """
     async with semaphore:
         completion = await client.chat.completions.create(
             model=model,
@@ -163,13 +148,12 @@ async def call_groq(
         )
 
     choice = completion.choices[0]
-    finish_reason = choice.finish_reason
-    if finish_reason == "content_filter":
-        raise SafetyRefusal(f"groq:{model} finish_reason=content_filter")
+    if choice.finish_reason == "content_filter":
+        raise SafetyRefusal(f"{model}: finish_reason=content_filter")
 
     text = choice.message.content
     if not text:
-        raise SafetyRefusal(f"groq:{model} returned empty content (likely refused)")
+        raise SafetyRefusal(f"{model}: returned empty content (likely refused)")
 
     usage = completion.usage
     return LLMResponse(
@@ -177,7 +161,7 @@ async def call_groq(
         input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
         output_tokens=getattr(usage, "completion_tokens", 0) or 0,
         model=model,
-        provider="groq",
+        provider="openai-compatible",
     )
 
 

@@ -13,7 +13,11 @@ from pydantic import BaseModel, Field
 Category = Literal["logic", "security", "resource", "concurrency", "api-misuse"]
 Severity = Literal["high", "medium", "low"]
 Verdict = Literal["confirmed", "false_positive", "uncertain"]
-ValidatorFamily = Literal["llama", "gemini"]
+# Was Literal["llama", "gemini"] - loosened once the pipeline went
+# provider-agnostic (any OpenAI-compatible endpoint), since the validator
+# family is now whatever model name a visitor configured, not one of two
+# fixed strings.
+ValidatorFamily = str
 
 
 class Finding(BaseModel):

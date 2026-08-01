@@ -30,7 +30,10 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Static
 
 import cli
-from llm import GEMINI_FLASH, GEMINI_FLASH_LITE, GROQ_PRIMARY
+from llm import (
+    GEMINI_FLASH, GEMINI_FLASH_LITE, GEMINI_OPENAI_COMPAT_BASE_URL,
+    GROQ_OPENAI_COMPAT_BASE_URL, GROQ_PRIMARY, ProviderConfig,
+)
 from main import run_review
 
 DEMO_OWNER, DEMO_REPO, DEMO_PR = "SadamAnjaneyulu", "oss-bugbot", 2
@@ -314,10 +317,17 @@ class BugbotTUI(App):
                     post_this_run = await self.push_screen_wait(ConfirmPostScreen(owner, repo, pr_number))
                     log.write("[dim]Posting for real this run[/]" if post_this_run else "[dim]Dry run (declined)[/]")
 
+                # Provider-agnostic pipeline; the TUI still just uses the
+                # zero-config Gemini+Groq default - bring-your-own-arbitrary-
+                # provider is web-UI-only, see README.
+                a1_config = ProviderConfig(GEMINI_OPENAI_COMPAT_BASE_URL, self.gemini_api_key, GEMINI_FLASH_LITE)
+                a2_config = ProviderConfig(GEMINI_OPENAI_COMPAT_BASE_URL, self.gemini_api_key, GEMINI_FLASH)
+                a3_primary_config = ProviderConfig(GROQ_OPENAI_COMPAT_BASE_URL, self.groq_api_key, GROQ_PRIMARY)
+                a3_fallback_config = ProviderConfig(GEMINI_OPENAI_COMPAT_BASE_URL, self.gemini_api_key, GEMINI_FLASH)
                 result = await run_review(
                     owner, repo, pr_number, info["head_sha"], self.github_token,
-                    self.gemini_api_key, self.groq_api_key, checkout, post=post_this_run,
-                    on_progress=self.on_progress,
+                    a1_config, a2_config, a3_primary_config, a3_fallback_config, checkout,
+                    post=post_this_run, on_progress=self.on_progress,
                 )
 
             Path("findings.json").write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")

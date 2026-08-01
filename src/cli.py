@@ -40,7 +40,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich import box
 
-from main import run_review
+from main import default_provider_configs_from_env, run_review
 
 PR_URL_RE = re.compile(r"github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
 REPO_URL_RE = re.compile(r"github\.com/([^/\s]+)/([^/\s.]+?)(?:\.git)?/?$")
@@ -202,8 +202,7 @@ def check_env_vars() -> list[str]:
     ] if not val]
 
 
-def run_one_review(owner: str, repo: str, pr_number: int, github_token: str,
-                    gemini_api_key: str, groq_api_key: str, post: bool) -> dict | None:
+def run_one_review(owner: str, repo: str, pr_number: int, github_token: str, post: bool) -> dict | None:
     """Resolve -> clone -> review for exactly one PR. Returns the result
     dict, or None if a handled error occurred (already printed). Shared by
     both the --pr single-shot flag and the interactive session below - one
@@ -242,11 +241,15 @@ def run_one_review(owner: str, repo: str, pr_number: int, github_token: str,
             return None
         console.print("[bold green][OK][/] Cloned")
 
+        # Provider-agnostic pipeline; the CLI still just uses the zero-config
+        # Gemini+Groq default (env vars already validated by check_env_vars) -
+        # bring-your-own-arbitrary-provider is web-UI-only, see README.
+        a1_config, a2_config, a3_primary_config, a3_fallback_config = default_provider_configs_from_env()
         with console.status("[bold cyan]Running review[/] - 4x Gemini, vote, Groq adversarial validate "
                              "[dim](typically 20-60s)[/]...", spinner="dots"):
             result = asyncio.run(run_review(
                 owner, repo, pr_number, info["head_sha"], github_token,
-                gemini_api_key, groq_api_key, checkout, post=post,
+                a1_config, a2_config, a3_primary_config, a3_fallback_config, checkout, post=post,
             ))
         console.print("[bold green][OK][/] Review complete\n")
 
@@ -295,7 +298,7 @@ def resolve_pr_from_repo(owner: str, repo: str, github_token: str) -> int | None
     return int(choice)
 
 
-def run_interactive(github_token: str, gemini_api_key: str, groq_api_key: str) -> int:
+def run_interactive(github_token: str) -> int:
     """Claude Code / OpenCode style: launch once, paste PR URLs into the
     running session, keep going until you quit. Reuses run_one_review for
     every iteration - the interactive loop is presentation, not new logic.
@@ -334,7 +337,7 @@ def run_interactive(github_token: str, gemini_api_key: str, groq_api_key: str) -
             console.print("\n[dim]Goodbye.[/]")
             return 0
 
-        result = run_one_review(owner, repo, pr_number, github_token, gemini_api_key, groq_api_key, post)
+        result = run_one_review(owner, repo, pr_number, github_token, post)
         if result is not None:
             print_findings(result, posted_for_real=post)
         console.print()
@@ -357,11 +360,9 @@ def main() -> int:
         return 1
 
     github_token = os.environ["GITHUB_TOKEN"]
-    gemini_api_key = os.environ["GEMINI_API_KEY"]
-    groq_api_key = os.environ["GROQ_API_KEY"]
 
     if args.pr is None:
-        return run_interactive(github_token, gemini_api_key, groq_api_key)
+        return run_interactive(github_token)
 
     print_banner()
     try:
@@ -370,7 +371,7 @@ def main() -> int:
         err_console.print(f"[bold red]Error:[/] {exc}")
         return 1
 
-    result = run_one_review(owner, repo, pr_number, github_token, gemini_api_key, groq_api_key, args.post)
+    result = run_one_review(owner, repo, pr_number, github_token, args.post)
     if result is None:
         return 1
     print_findings(result, posted_for_real=args.post)
