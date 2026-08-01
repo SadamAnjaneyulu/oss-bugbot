@@ -144,6 +144,15 @@ python src/cli.py --pr https://github.com/owner/repo/pull/123
 pip install -r requirements.txt
 ```
 
+**If you're developing locally**, also install the pre-commit secret scanner —
+this repo's history includes real instances of API keys getting hardcoded into
+throwaway scripts during development, caught only by manual review each time:
+
+```bash
+pip install pre-commit detect-secrets
+pre-commit install
+```
+
 Repo secrets required (Settings → Secrets and variables → Actions):
 
 | Secret | Where to get it |
