@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 from rich.console import Console
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -47,6 +48,83 @@ class TestParsePrUrl(unittest.TestCase):
     def test_repo_names_with_dots_and_dashes(self):
         owner, repo, num = cli.parse_pr_url("https://github.com/my-org/my.repo-name/pull/42")
         self.assertEqual((owner, repo, num), ("my-org", "my.repo-name", 42))
+
+
+class TestParseGithubUrl(unittest.TestCase):
+    def test_pr_url_returns_pr_number(self):
+        owner, repo, num = cli.parse_github_url("https://github.com/owner/repo/pull/42")
+        self.assertEqual((owner, repo, num), ("owner", "repo", 42))
+
+    def test_bare_repo_url_returns_none_pr_number(self):
+        # This is the actual fix: someone pasting a plain repo link (the
+        # common case, not the exception) must not just get a regex error.
+        owner, repo, num = cli.parse_github_url("https://github.com/SadamAnjaneyulu/quant-trading-system")
+        self.assertEqual((owner, repo), ("SadamAnjaneyulu", "quant-trading-system"))
+        self.assertIsNone(num)
+
+    def test_bare_repo_url_trailing_slash(self):
+        owner, repo, num = cli.parse_github_url("https://github.com/owner/repo/")
+        self.assertEqual((owner, repo), ("owner", "repo"))
+        self.assertIsNone(num)
+
+    def test_bare_repo_url_dot_git_suffix(self):
+        owner, repo, num = cli.parse_github_url("https://github.com/owner/repo.git")
+        self.assertEqual((owner, repo), ("owner", "repo"))
+        self.assertIsNone(num)
+
+    def test_garbage_gives_actionable_message_not_regex_jargon(self):
+        with self.assertRaises(ValueError) as ctx:
+            cli.parse_github_url("not a url at all")
+        # The error must guide a non-technical user toward what to paste,
+        # not just state what it isn't.
+        self.assertIn("github.com/owner/repo", str(ctx.exception))
+
+
+class TestListOpenPrs(unittest.TestCase):
+    def test_returns_pr_list(self):
+        def handler(request):
+            return httpx.Response(200, json=[{"number": 5, "title": "Fix bug"}])
+        with patch("cli.httpx.AsyncClient", return_value=httpx.AsyncClient(transport=httpx.MockTransport(handler))):
+            prs = asyncio.run(cli.list_open_prs("o", "r", "tok"))
+        self.assertEqual(prs, [{"number": 5, "title": "Fix bug"}])
+
+    def test_empty_list_when_no_open_prs(self):
+        def handler(request):
+            return httpx.Response(200, json=[])
+        with patch("cli.httpx.AsyncClient", return_value=httpx.AsyncClient(transport=httpx.MockTransport(handler))):
+            prs = asyncio.run(cli.list_open_prs("o", "r", "tok"))
+        self.assertEqual(prs, [])
+
+
+class TestResolvePrFromRepo(unittest.TestCase):
+    def test_no_open_prs_explains_and_returns_none(self):
+        async def fake_list(*a, **kw):
+            return []
+        with patch("cli.list_open_prs", side_effect=fake_list):
+            result = cli.resolve_pr_from_repo("o", "r", "tok")
+        self.assertIsNone(result)
+
+    def test_single_pr_auto_selected(self):
+        async def fake_list(*a, **kw):
+            return [{"number": 7, "title": "Fix thing"}]
+        with patch("cli.list_open_prs", side_effect=fake_list):
+            result = cli.resolve_pr_from_repo("o", "r", "tok")
+        self.assertEqual(result, 7)
+
+    def test_multiple_prs_prompts_and_returns_chosen(self):
+        async def fake_list(*a, **kw):
+            return [{"number": 3, "title": "A"}, {"number": 9, "title": "B"}]
+        with patch("cli.list_open_prs", side_effect=fake_list), \
+             patch("cli.Prompt.ask", return_value="9"):
+            result = cli.resolve_pr_from_repo("o", "r", "tok")
+        self.assertEqual(result, 9)
+
+    def test_lookup_failure_returns_none_not_raises(self):
+        async def fake_list(*a, **kw):
+            raise httpx.HTTPStatusError("boom", request=None, response=httpx.Response(404))
+        with patch("cli.list_open_prs", side_effect=fake_list):
+            result = cli.resolve_pr_from_repo("o", "r", "tok")
+        self.assertIsNone(result)
 
 
 class TestPrintFindings(unittest.TestCase):

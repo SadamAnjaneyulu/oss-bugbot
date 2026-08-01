@@ -43,6 +43,8 @@ from rich import box
 from main import run_review
 
 PR_URL_RE = re.compile(r"github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
+REPO_URL_RE = re.compile(r"github\.com/([^/\s]+)/([^/\s.]+?)(?:\.git)?/?$")
+GITHUB_API = "https://api.github.com"
 CLONE_TIMEOUT_SECONDS = 120
 
 # Presentation only - every function below this line is display, not logic.
@@ -68,6 +70,40 @@ def parse_pr_url(url: str) -> tuple[str, str, int]:
         raise ValueError(f"not a GitHub PR URL (expected .../owner/repo/pull/N): {url}")
     owner, repo, number = m.groups()
     return owner, repo, int(number)
+
+
+def parse_github_url(url: str) -> tuple[str, str, int | None]:
+    """Interactive mode's entry point - accepts either a full PR link or a
+    bare repo link. pr_number is None for a bare repo link; the caller
+    resolves which PR to review via list_open_prs. Most people pasting a
+    link into this will paste the repo, not a specific PR - this is the
+    fix for that, not a workaround for it.
+    """
+    url = url.strip()
+    m = PR_URL_RE.search(url)
+    if m:
+        owner, repo, number = m.groups()
+        return owner, repo, int(number)
+    m = REPO_URL_RE.search(url)
+    if m:
+        owner, repo = m.groups()
+        return owner, repo, None
+    raise ValueError(
+        f"that doesn't look like a GitHub link. Paste a repo "
+        f"(github.com/owner/repo) or a specific pull request "
+        f"(github.com/owner/repo/pull/N): {url}"
+    )
+
+
+async def list_open_prs(owner: str, repo: str, token: str) -> list[dict]:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/pulls",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            params={"state": "open", "per_page": 25, "sort": "updated", "direction": "desc"},
+        )
+        resp.raise_for_status()
+        return resp.json()
 
 
 async def resolve_pr_info(owner: str, repo: str, pr_number: int, token: str) -> dict:
@@ -218,17 +254,58 @@ def run_one_review(owner: str, repo: str, pr_number: int, github_token: str,
     return result
 
 
+def resolve_pr_from_repo(owner: str, repo: str, github_token: str) -> int | None:
+    """A bare repo link has no diff to review - there has to be an actual
+    open PR. Lists them and picks one (auto-picks if there's exactly one).
+    Returns None if there's nothing to review or the lookup failed - both
+    cases are already explained to the user, caller just continues the loop.
+    """
+    try:
+        with console.status(f"[bold cyan]Looking up open pull requests[/] on {owner}/{repo}...", spinner="dots"):
+            prs = asyncio.run(list_open_prs(owner, repo, github_token))
+    except httpx.HTTPStatusError as exc:
+        err_console.print(f"[bold red]Error:[/] could not look up {owner}/{repo} ({exc.response.status_code}). "
+                           f"Check the repo name is right and it's public.\n")
+        return None
+    except httpx.RequestError as exc:
+        err_console.print(f"[bold red]Error:[/] network request to GitHub failed: {exc}\n")
+        return None
+
+    if not prs:
+        console.print(f"[yellow]{owner}/{repo} doesn't have any open pull requests right now[/] - "
+                       f"there's nothing to review. Try a repo with an active PR, or paste a "
+                       f"direct link to a specific pull request instead.\n")
+        return None
+
+    if len(prs) == 1:
+        console.print(f"[dim]One open PR - reviewing #{prs[0]['number']}: {prs[0]['title']}[/]")
+        return prs[0]["number"]
+
+    table = Table(title=f"{len(prs)} open pull requests on {owner}/{repo}", box=box.ROUNDED)
+    table.add_column("#", style="bold")
+    table.add_column("Title")
+    for pr in prs:
+        table.add_row(str(pr["number"]), pr["title"])
+    console.print(table)
+
+    try:
+        choice = Prompt.ask("Which one? (number)", choices=[str(pr["number"]) for pr in prs], show_choices=False)
+    except (EOFError, KeyboardInterrupt):
+        return None
+    return int(choice)
+
+
 def run_interactive(github_token: str, gemini_api_key: str, groq_api_key: str) -> int:
     """Claude Code / OpenCode style: launch once, paste PR URLs into the
     running session, keep going until you quit. Reuses run_one_review for
     every iteration - the interactive loop is presentation, not new logic.
     """
     print_banner()
-    console.print("[dim]Paste a GitHub PR URL to review it. Type 'exit' or press Ctrl+C to quit.[/]\n")
+    console.print("[dim]Paste a GitHub repo or pull request link. Type 'exit' or press Ctrl+C to quit.[/]\n")
 
     while True:
         try:
-            url = Prompt.ask("[bold cyan]PR URL[/]")
+            url = Prompt.ask("[bold cyan]Repo or PR URL[/]")
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Goodbye.[/]")
             return 0
@@ -241,10 +318,15 @@ def run_interactive(github_token: str, gemini_api_key: str, groq_api_key: str) -
             continue
 
         try:
-            owner, repo, pr_number = parse_pr_url(url)
+            owner, repo, pr_number = parse_github_url(url)
         except ValueError as exc:
             err_console.print(f"[bold red]Error:[/] {exc}\n")
             continue
+
+        if pr_number is None:
+            pr_number = resolve_pr_from_repo(owner, repo, github_token)
+            if pr_number is None:
+                continue  # already explained why - no open PRs, or lookup failed
 
         try:
             post = Confirm.ask("Actually post the review to GitHub?", default=False)
