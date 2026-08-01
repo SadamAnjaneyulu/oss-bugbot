@@ -9,6 +9,7 @@ the diff. See plan "Diff acquisition: metadata first, then diff".
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 
 import httpx
@@ -149,3 +150,21 @@ def parse_changed_lines(diff_text: str) -> dict[str, set[int]]:
                     lines.add(line.target_line_no)
         result[filename] = lines
     return result
+
+
+def shuffle_hunks(diff_text: str, seed: int) -> str:
+    """Reorders complete per-file diff sections (unidiff serializes a
+    PatchedFile as a whole, hunks-and-all - not individual hunks within one
+    file). Each of A1's 4 passes gets the same diff in a different order,
+    nudging the model toward different reasoning paths per pass. See plan
+    "Cursor's trick: forces divergent reasoning paths".
+    """
+    if not diff_text.strip():
+        return diff_text
+    patch = PatchSet(diff_text)
+    files = list(patch)
+    if len(files) <= 1:
+        return diff_text
+    rng = random.Random(seed)
+    rng.shuffle(files)
+    return "\n".join(str(f) for f in files)

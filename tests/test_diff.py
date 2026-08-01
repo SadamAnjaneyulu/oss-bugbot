@@ -91,6 +91,52 @@ class TestParseChangedLines(unittest.TestCase):
         self.assertEqual(diff.parse_changed_lines(""), {})
 
 
+TWO_FILE_DIFF = """\
+diff --git a/a.py b/a.py
+index 1111111..2222222 100644
+--- a/a.py
++++ b/a.py
+@@ -1,1 +1,1 @@
+-old_a
++new_a
+diff --git a/b.py b/b.py
+index 3333333..4444444 100644
+--- a/b.py
++++ b/b.py
+@@ -1,1 +1,1 @@
+-old_b
++new_b
+"""
+
+
+class TestShuffleHunks(unittest.TestCase):
+    def test_empty_diff_returns_empty(self):
+        self.assertEqual(diff.shuffle_hunks("", 42), "")
+
+    def test_single_file_diff_unchanged(self):
+        result = diff.shuffle_hunks(SAMPLE_DIFF, 42)
+        self.assertIn("src/app.py", result)
+
+    def test_all_files_preserved_after_shuffle(self):
+        result = diff.shuffle_hunks(TWO_FILE_DIFF, seed=1)
+        self.assertIn("a.py", result)
+        self.assertIn("b.py", result)
+        self.assertIn("new_a", result)
+        self.assertIn("new_b", result)
+
+    def test_same_seed_is_deterministic(self):
+        r1 = diff.shuffle_hunks(TWO_FILE_DIFF, seed=7)
+        r2 = diff.shuffle_hunks(TWO_FILE_DIFF, seed=7)
+        self.assertEqual(r1, r2)
+
+    def test_different_seeds_can_produce_different_order(self):
+        # Not a strict guarantee for n=2 (50% chance of matching order per
+        # seed pair), so try a spread of seeds and require at least one
+        # observed reordering rather than asserting on a single pair.
+        orders = {diff.shuffle_hunks(TWO_FILE_DIFF, seed=s) for s in range(10)}
+        self.assertGreater(len(orders), 1, "expected at least one differently-ordered result across 10 seeds")
+
+
 class TestFetchPRFiles(unittest.TestCase):
     def test_single_page(self):
         def handler(request: httpx.Request) -> httpx.Response:

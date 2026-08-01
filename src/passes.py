@@ -11,7 +11,6 @@ final turn with no function_call AND no text counts as a refusal.
 
 from __future__ import annotations
 
-import random
 from dataclasses import dataclass
 
 from google.genai import types as gtypes
@@ -125,14 +124,17 @@ def _build_config(schema: dict, include_tools: bool) -> gtypes.GenerateContentCo
     )
 
 
-async def _run_tool_loop(client, model: str, semaphore, root, diff_text: str, pass_id: str, hunk_order_seed: int) -> tuple[str, PassUsage]:
+async def _run_tool_loop(client, model: str, semaphore, root, diff_text: str, pass_id: str) -> tuple[str, PassUsage]:
+    """diff_text is used exactly as given - the caller (run_pass, via
+    diff.shuffle_hunks) is responsible for giving each pass a differently
+    ordered diff. This function does not reorder anything itself.
+    """
     schema = to_response_schema(ReviewerOutput)
     usage = PassUsage()
 
     user_text = (
         f"pass_id: {pass_id}\n"
-        f"<untrusted_diff>\n{diff_text}\n</untrusted_diff>\n"
-        f"(hunk order seed: {hunk_order_seed} - review every hunk regardless of order)"
+        f"<untrusted_diff>\n{diff_text}\n</untrusted_diff>"
     )
     contents = [gtypes.Content(role="user", parts=[gtypes.Part(text=user_text)])]
 
@@ -189,11 +191,12 @@ async def run_pass(client, model: str, semaphore, root, diff_text: str, pass_id:
     """Runs one A1 pass end to end: tool loop -> G1 -> retry-same-node.
     Returns None (never raises) on NodeExhausted - caller drops this pass
     and recomputes the vote threshold over survivors. Degrade, never crash.
+    Caller is responsible for giving each pass a differently-ordered
+    diff_text (via diff.shuffle_hunks) - this function reviews whatever it
+    is given, in the order it is given.
     """
-    hunk_order_seed = random.randint(0, 1_000_000)
-
     async def agent_call(feedback: str | None):
-        text, usage = await _run_tool_loop(client, model, semaphore, root, diff_text, pass_id, hunk_order_seed)
+        text, usage = await _run_tool_loop(client, model, semaphore, root, diff_text, pass_id)
         return text
 
     def validate_fn(raw_text: str) -> ReviewerOutput:
