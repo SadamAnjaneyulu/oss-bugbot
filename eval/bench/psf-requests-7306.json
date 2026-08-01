@@ -1,0 +1,14 @@
+{
+  "case_id": "psf-requests-7306",
+  "source_pr": "https://github.com/psf/requests/pull/7306",
+  "source_title": "Fix unintended \"test\" extra",
+  "category": "logic",
+  "base_sha": "7407309c8a8a73aa2f4337184025d440bbedab7a",
+  "head_sha": "d239efdd29918070446efaefd81a5d9dfa4eb522",
+  "diff": "diff --git a/pyproject.toml b/pyproject.toml\nindex 8b77f73..dcb537c 100644\n--- a/pyproject.toml\n+++ b/pyproject.toml\n@@ -52,17 +52,13 @@ Source = \"https://github.com/psf/requests\"\n security = []\n socks = [\"PySocks>=1.5.6, !=1.5.7\"]\n use_chardet_on_py3 = [\"chardet>=3.0.2,<8\"]\n-\n-[dependency-groups]\n test = [\n     \"requests[socks]\",\n     \"pytest-httpbin==2.1.0\",\n-    \"httpbin~=0.10.0\",\n     \"pytest-cov\",\n     \"pytest-mock\",\n     \"pytest-xdist\",\n-    \"pytest>=3\",\n-    \"trustme\",\n+    \"pytest>=3\"\n ]\n \n [tool.setuptools]\n",
+  "ground_truth": {
+    "pyproject.toml": [
+      61
+    ]
+  }
+}

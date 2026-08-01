@@ -98,6 +98,18 @@ class TestFetchPrShas(unittest.TestCase):
         result = asyncio.run(harvest.fetch_pr_shas(client, candidate, "tok"))
         self.assertIsNone(result)
 
+    def test_deleted_fork_head_repo_null_does_not_crash(self):
+        # GitHub returns head.repo: null once the PR's source fork/branch
+        # has been deleted - common for old merged PRs. Caught by a live
+        # run against real historical PRs, not anticipated up front.
+        candidate = harvest.Candidate("o", "r", 1, "Fix bug")
+        body = {"changed_files": 1, "additions": 5, "deletions": 5,
+                "base": {"sha": "a", "repo": {"full_name": "o/r"}},
+                "head": {"sha": "b", "repo": None}}
+        client = self._client(body)
+        result = asyncio.run(harvest.fetch_pr_shas(client, candidate, "tok"))
+        self.assertIsNone(result)
+
     def test_fork_pr_rejected(self):
         candidate = harvest.Candidate("o", "r", 1, "Fix bug")
         body = {"changed_files": 1, "additions": 5, "deletions": 5,

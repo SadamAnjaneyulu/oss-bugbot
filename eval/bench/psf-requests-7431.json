@@ -1,0 +1,23 @@
+{
+  "case_id": "psf-requests-7431",
+  "source_pr": "https://github.com/psf/requests/pull/7431",
+  "source_title": "Fix mutability issues with headers input types",
+  "category": "security",
+  "base_sha": "0b401c76b6e80a4eecf3c690085b2553f6e261ca",
+  "head_sha": "0a074cadfaccfbdd2f841d567a4c1a9132a72cd4",
+  "diff": "diff --git a/src/requests/_types.py b/src/requests/_types.py\nindex edce94d..963867b 100644\n--- a/src/requests/_types.py\n+++ b/src/requests/_types.py\n@@ -109,7 +109,8 @@ if TYPE_CHECKING:\n         bytes | str | Iterable[bytes | str] | SupportsRead[bytes | str] | None\n     )\n \n-    HeadersType: TypeAlias = MutableMapping[str, str | bytes] | None\n+    HeadersType: TypeAlias = CaseInsensitiveDict[str] | Mapping[str, str | bytes]\n+    HeadersUpdateType: TypeAlias = Mapping[str, str | bytes | None]\n \n     CookiesType: TypeAlias = RequestsCookieJar | Mapping[str, str]\n \n@@ -144,7 +145,7 @@ if TYPE_CHECKING:\n     # TypedDicts for Unpack kwargs (PEP 692)\n \n     class BaseRequestKwargs(TypedDict, total=False):\n-        headers: HeadersType\n+        headers: Mapping[str, str | bytes] | None\n         cookies: RequestsCookieJar | CookieJar | dict[str, str] | None\n         files: FilesType\n         auth: AuthType\ndiff --git a/src/requests/models.py b/src/requests/models.py\nindex e35d060..4142f2a 100644\n--- a/src/requests/models.py\n+++ b/src/requests/models.py\n@@ -83,7 +83,6 @@ from .utils import (\n )\n \n if TYPE_CHECKING:\n-    from collections.abc import MutableMapping\n     from http.cookiejar import CookieJar\n \n     from typing_extensions import Self\n@@ -311,7 +310,7 @@ class Request(RequestHooksMixin):\n \n     method: str | None\n     url: _t.UriType | None\n-    headers: MutableMapping[str, str | bytes]\n+    headers: CaseInsensitiveDict[str] | Mapping[str, str | bytes] | None\n     files: _t.FilesType\n     data: _t.DataType\n     json: _t.JsonType\n@@ -323,7 +322,7 @@ class Request(RequestHooksMixin):\n         self,\n         method: str | None = None,\n         url: _t.UriType | None = None,\n-        headers: _t.HeadersType = None,\n+        headers: Mapping[str, str | bytes] | None = None,\n         files: _t.FilesType = None,\n         data: _t.DataType = None,\n         params: _t.ParamsType = None,\ndiff --git a/src/requests/sessions.py b/src/requests/sessions.py\nindex feaf340..8f13887 100644\n--- a/src/requests/sessions.py\n+++ b/src/requests/sessions.py\n@@ -560,7 +560,7 @@ class Session(SessionRedirectMixin):\n         url: _t.UriType,\n         params: _t.ParamsType = None,\n         data: _t.DataType = None,\n-        headers: _t.HeadersType = None,\n+        headers: Mapping[str, str | bytes] | None = None,\n         cookies: RequestsCookieJar | CookieJar | dict[str, str] | None = None,\n         files: _t.FilesType = None,\n         auth: _t.AuthType = None,\n",
+  "ground_truth": {
+    "src/requests/_types.py": [
+      112,
+      113,
+      148
+    ],
+    "src/requests/models.py": [
+      313,
+      325
+    ],
+    "src/requests/sessions.py": [
+      563
+    ]
+  }
+}

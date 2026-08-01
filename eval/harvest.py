@@ -105,6 +105,12 @@ async def fetch_pr_shas(client: httpx.AsyncClient, candidate: Candidate, token: 
         return None
     if (data.get("additions", 0) + data.get("deletions", 0)) > MAX_CASE_LINES:
         return None
+    # GitHub returns head.repo: null once the PR's source fork/branch has
+    # been deleted - common for old merged PRs, not exotic. Same defect
+    # already fixed in cli.py's resolve_pr_info; missed applying it here
+    # until a live run against real historical PRs hit it.
+    if data["base"]["repo"] is None or data["head"]["repo"] is None:
+        return None
     if data["base"]["repo"]["full_name"] != data["head"]["repo"]["full_name"]:
         return None  # fork PR - base/head SHAs may not share ancestry in a shallow local clone
 
