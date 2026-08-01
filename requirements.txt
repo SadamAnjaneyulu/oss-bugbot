@@ -1,0 +1,5 @@
+httpx
+unidiff
+pydantic>=2
+pyyaml
+semgrep
