@@ -29,6 +29,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Static
 
 import cli
+from llm import GEMINI_FLASH, GEMINI_FLASH_LITE, GROQ_PRIMARY
 from main import run_review
 
 STAGE_LABELS = {
@@ -125,12 +126,33 @@ class ConfirmPostScreen(ModalScreen[bool]):
 
 
 class BugbotTUI(App):
+    TITLE = "oss-bugbot"
+    SUB_TITLE = "AI code review, $0/month"
+
     CSS = """
     Screen { layout: vertical; }
     #body { height: 1fr; }
-    #log { width: 3fr; border: solid $accent; padding: 0 1; }
-    #sidebar { width: 1fr; border: solid $accent; padding: 0 1; }
-    #sidebar Static { margin-bottom: 1; }
+    #log {
+        width: 3fr;
+        border: round $primary;
+        border-title-color: $primary;
+        border-title-style: bold;
+        padding: 0 1;
+    }
+    #sidebar {
+        width: 1fr;
+        min-width: 32;
+        border: round $secondary;
+        border-title-color: $secondary;
+        border-title-style: bold;
+        padding: 1;
+    }
+    #sidebar .section-label { color: $secondary; text-style: bold; margin-top: 1; }
+    #sidebar .section-label:first-of-type { margin-top: 0; }
+    #stage { color: $text; margin-bottom: 1; }
+    #checklist { color: $text-muted; }
+    #models { color: $text-muted; }
+    #tokens { color: $success; }
     #url-input { dock: bottom; }
     """
     BINDINGS = [("ctrl+c", "quit", "Quit")]
@@ -149,20 +171,28 @@ class BugbotTUI(App):
         with Horizontal(id="body"):
             yield RichLog(id="log", markup=True, wrap=True, highlight=False)
             with Vertical(id="sidebar"):
-                yield Static("[bold]oss-bugbot[/]\n4x Gemini . vote . Groq validate\n$0/month", id="banner")
+                yield Static("Status", classes="section-label")
                 yield Static("[dim]Idle - paste a repo or PR link below[/]", id="stage")
-                yield Static("", id="checklist")
-                yield Static("", id="tokens")
+                yield Static("Pipeline", classes="section-label")
+                yield Static("[dim]No review running yet.[/]", id="checklist")
+                yield Static("Models", classes="section-label")
+                yield Static(
+                    f"[dim]A1[/] {GEMINI_FLASH_LITE}\n[dim]A2[/] {GEMINI_FLASH}\n[dim]A3[/] {GROQ_PRIMARY}",
+                    id="models",
+                )
+                yield Static("Usage", classes="section-label")
+                yield Static("[dim]No tokens spent yet.[/]", id="tokens")
         yield Input(placeholder="github.com/owner/repo or .../pull/N  (or 'exit')", id="url-input")
         yield Footer()
 
     def on_mount(self) -> None:
+        self.query_one("#log", RichLog).border_title = "Review log"
+        self.query_one("#sidebar", Vertical).border_title = "oss-bugbot"
         log = self.query_one("#log", RichLog)
-        log.write(Panel.fit(
-            "[bold cyan]oss-bugbot[/] [dim]local TUI[/]\n"
-            "[dim]Paste a GitHub repo or pull request link below. Ctrl+C to quit.[/]",
-            border_style="cyan",
-        ))
+        log.write(
+            "[dim]4x Gemini review . vote . Groq adversarial validate[/]\n"
+            "[dim]Paste a GitHub repo or pull request link below. Ctrl+C to quit.[/]"
+        )
         self.query_one(Input).focus()
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
