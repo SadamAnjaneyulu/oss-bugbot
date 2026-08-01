@@ -10,7 +10,6 @@ infrastructure — and is built to work on fork PRs, not just same-repo demos.**
 [![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](requirements.txt)
 [![Cost](https://img.shields.io/badge/cost-%240%2Fmonth-brightgreen)](#architecture)
 [![Security](https://img.shields.io/badge/pull__request__target-hardened-critical)](#security-model-read-this-first)
-[![Tests](https://img.shields.io/badge/tests-172%20passing-brightgreen)](tests/)
 
 </div>
 
