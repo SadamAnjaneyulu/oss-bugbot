@@ -115,6 +115,64 @@ class TestRunReviewHappyPath(unittest.TestCase):
         self.assertEqual(len(posted_comments), 1)
         self.assertEqual(posted_comments[0]["path"], "app.py")
 
+    def test_dry_run_never_calls_post_review_but_still_reports_findings(self):
+        # cli.py's default (--post not passed) must never hit the write
+        # endpoint - this is the actual safety property, not just a flag
+        # that exists. Assert the real post_review function is never
+        # invoked, not just that the result dict looks right.
+        files = [FileMeta("app.py", "modified", 2, 1, 3)]
+        diff_text = (
+            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+            "@@ -1,1 +1,2 @@\n def f():\n+    return None\n"
+        )
+        finding = Finding(
+            file="app.py", line=2, category="logic", severity="high", title="bug",
+            reasoning="x", evidence_lines=[2], self_confidence=0.8,
+        )
+        pass_result = type("R", (), {"findings": [finding]})()
+        cluster = Cluster(cluster_id="c1", vote_count=4, supporting_pass_ids=["p1", "p2", "p3", "p4"], merged=finding)
+        verdict = ValidatorOutput(
+            cluster_id="c1", verdict="confirmed", refutation="none",
+            validator_family="llama", validator_confidence=0.9, comment_markdown="**Bug**: real",
+        )
+
+        async def fake_fetch_pr_files(*a, **kw):
+            return files
+
+        async def fake_fetch_diff(*a, **kw):
+            return diff_text
+
+        async def fake_run_pass(*a, **kw):
+            return pass_result
+
+        async def fake_run_aggregation(*a, **kw):
+            return [cluster], False
+
+        async def fake_run_all_validators(*a, **kw):
+            return [verdict]
+
+        async def fake_fetch_existing_markers(*a, **kw):
+            return set()
+
+        with TemporaryDirectory() as tmp, \
+             patch("main.fetch_pr_files", side_effect=fake_fetch_pr_files), \
+             patch("main.fetch_diff", side_effect=fake_fetch_diff), \
+             patch("main.run_semgrep", return_value={}), \
+             patch("main.run_pass", side_effect=fake_run_pass), \
+             patch("main.run_aggregation", side_effect=fake_run_aggregation), \
+             patch("main.run_all_validators", side_effect=fake_run_all_validators), \
+             patch("main.fetch_existing_markers", side_effect=fake_fetch_existing_markers), \
+             patch("main.post_review") as mock_post_review, \
+             patch("main.genai.Client"), patch("main.AsyncGroq"):
+            result = asyncio.run(main.run_review("o", "r", 1, "sha", "tok", "gk", "qk", Path(tmp), post=False))
+
+        mock_post_review.assert_not_called()
+        self.assertEqual(len(result["findings"]), 1)
+        self.assertEqual(result["findings"][0]["verdict"], "confirmed")
+        self.assertEqual(result["post_result"]["reason"], "dry_run")
+        self.assertEqual(result["post_result"]["count"], 1)
+        self.assertFalse(result["post_result"]["posted"])
+
     def test_false_positive_never_reaches_post(self):
         files = [FileMeta("app.py", "modified", 1, 0, 1)]
         diff_text = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1,0 +1,1 @@\n+x = 1\n"
